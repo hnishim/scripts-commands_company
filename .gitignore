@@ -1,0 +1,38 @@
+# OAuth credentials and local configuration
+credentials.json
+token.json
+**/credentials.json
+**/token.json
+client_secret*.json
+.env
+.env.*
+!.env.example
+
+# Local Python environments and caches
+.venv/
+**/.venv/
+venv/
+**/venv/
+ENV/
+**/ENV/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+id_rsa
+id_ed25519
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Local-only and archived utilities
+_old/
+Jobcan_touch.applescript
