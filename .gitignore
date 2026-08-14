@@ -28,11 +28,3 @@ __pycache__/
 *.ppk
 id_rsa
 id_ed25519
-
-# macOS metadata
-.DS_Store
-**/.DS_Store
-
-# Local-only and archived utilities
-_old/
-Jobcan_touch.applescript
