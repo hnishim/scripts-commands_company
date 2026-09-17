@@ -6,6 +6,12 @@
 # @raycast.mode silent
 # @raycast.packageName Google Drive
 
+# Optional parameters:
+# @raycast.icon 🔗
+
+# Documentation:
+# @raycast.description クリップボードに格納されたGoogle Driveのフォルダ/ファイルへのURLから該当するものをローカルで開く
+
 set -uo pipefail
 
 # Google Drive for desktop's File Provider location. Set GOOGLE_DRIVE_ROOT when

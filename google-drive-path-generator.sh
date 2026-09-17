@@ -6,10 +6,10 @@
 # @raycast.mode compact
 
 # Optional parameters:
-# @raycast.icon 🔗
+# @raycast.icon 💻
 
 # Documentation:
-# @raycast.description クリップボードに格納されたGoogle Driveのフォルダ/ファイルへのURLから該当するものをローカルで開く
+# @raycast.description Google Driveのリンクから、ローカルのファイル/フォルダーを開く
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/googleDrivePathGenerator"
