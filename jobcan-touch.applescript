@@ -13,6 +13,20 @@
 
 use framework "Foundation"
 
+on launchdEnvironmentValue(environmentKey)
+    set launchTask to current application's NSTask's alloc()'s init()
+    launchTask's setLaunchPath:"/bin/launchctl"
+    launchTask's setArguments:{"getenv", environmentKey}
+    set outputPipe to current application's NSPipe's pipe()
+    launchTask's setStandardOutput:outputPipe
+    launchTask's |launch|()
+    launchTask's waitUntilExit()
+    set outputData to outputPipe's fileHandleForReading()'s readDataToEndOfFile()
+    set outputString to current application's NSString's alloc()'s initWithData:outputData encoding:(current application's NSUTF8StringEncoding)
+    if outputString is missing value then return ""
+    return (outputString's stringByTrimmingCharactersInSet:(current application's NSCharacterSet's whitespaceAndNewlineCharacterSet())) as text
+end launchdEnvironmentValue
+
 on isValidSlackIdentifier(candidateValue)
     if candidateValue is "" then return false
 
@@ -66,7 +80,7 @@ on run argv
     set processEnvironment to current application's NSProcessInfo's processInfo()'s environment()
     set slackURLValue to processEnvironment's objectForKey:"JOBCAN_SLACK_URL"
     if slackURLValue is missing value then
-        set slackURL to ""
+        set slackURL to launchdEnvironmentValue("JOBCAN_SLACK_URL")
     else
         set slackURL to slackURLValue as text
     end if
