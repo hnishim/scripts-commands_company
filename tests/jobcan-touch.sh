@@ -140,6 +140,30 @@ case "$guard_status" in
     *) fail 'could not verify the invalid-value guard' ;;
 esac
 
+# HIR-251 permanent safety regressions.
+# These checks intentionally cover source-level invariants only. They do not
+# claim that Slack Accessibility targeting, timeout behavior, single-run
+# exclusion, or pasteboard restoration work on a real Mac; those remain
+# explicit local acceptance checks.
+return_send_count="$(grep -Ec '^[[:space:]]*key code[[:space:]]+36([[:space:]]|$)' "$SCRIPT_PATH" || true)"
+[ "$return_send_count" -le 1 ] || fail 'more than one Return-style send operation is present'
+
+if grep -Eq '^[[:space:]]*key code[[:space:]]+36[[:space:]]+using[[:space:]]+\{command down\}' "$SCRIPT_PATH"; then
+    fail 'Cmd+Return fallback send must not coexist with the primary send path'
+fi
+
+# Preserving only a string is insufficient: HIR-251 requires the general
+# pasteboard item/type structure to be saved before mutation and written back.
+pasteboard_backup_line="$(grep -nE 'pasteboardItems' "$SCRIPT_PATH" | head -n 1 | cut -d: -f1 || true)"
+pasteboard_clear_line="$(grep -nE 'clearContents' "$SCRIPT_PATH" | head -n 1 | cut -d: -f1 || true)"
+pasteboard_restore_line="$(grep -nE 'writeObjects:' "$SCRIPT_PATH" | tail -n 1 | cut -d: -f1 || true)"
+
+[ -n "$pasteboard_backup_line" ] || fail 'pasteboard items are not backed up before mutation'
+[ -n "$pasteboard_clear_line" ] || fail 'pasteboard mutation point is missing'
+[ -n "$pasteboard_restore_line" ] || fail 'pasteboard items are not restored after mutation'
+[ "$pasteboard_backup_line" -lt "$pasteboard_clear_line" ] || fail 'pasteboard backup must occur before clearContents'
+[ "$pasteboard_restore_line" -gt "$pasteboard_clear_line" ] || fail 'pasteboard restoration must occur after mutation'
+
 # Exact private values are supplied only at test time and must not be written to the repository.
 # Provide one forbidden value per line, for example the real workspace ID, conversation ID,
 # or complete private deeplink. Every reachable Git commit is scanned.
