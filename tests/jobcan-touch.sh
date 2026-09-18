@@ -141,19 +141,192 @@ case "$guard_status" in
 esac
 
 # HIR-251 permanent safety regressions.
-# These checks intentionally cover source-level invariants only. They do not
-# claim that Slack Accessibility targeting, timeout behavior, single-run
-# exclusion, or pasteboard restoration work on a real Mac; those remain
-# explicit local acceptance checks.
+#
+# The orchestration tests below execute the production flow against a fake
+# side-effect adapter. They verify failure-boundary behavior without opening
+# Slack, mutating the real pasteboard, or sending a slash command.
+flow_runner="$(mktemp -u).applescript"
+cat > "$flow_runner" <<'APPLESCRIPT'
+on joinEvents(eventList)
+    set previousDelimiters to AppleScript's text item delimiters
+    set AppleScript's text item delimiters to ","
+    set joinedEvents to eventList as text
+    set AppleScript's text item delimiters to previousDelimiters
+    return joinedEvents
+end joinEvents
+
+on run argv
+    set candidateScript to load script POSIX file (item 1 of argv)
+    set scenarioName to item 2 of argv
+
+    script fakeAdapter
+        property lockAvailable : true
+        property composerReady : true
+        property failureStage : ""
+        property events : {}
+
+        on recordEvent(eventName)
+            set my events to my events & {eventName}
+        end recordEvent
+
+        on acquireSingleRunGuard()
+            my recordEvent("lock")
+            return my lockAvailable
+        end acquireSingleRunGuard
+
+        on activateSlack()
+            my recordEvent("activate")
+        end activateSlack
+
+        on openConfiguredConversation()
+            my recordEvent("open")
+        end openConfiguredConversation
+
+        on waitForComposer()
+            my recordEvent("wait")
+            return my composerReady
+        end waitForComposer
+
+        on backupPasteboard()
+            my recordEvent("backup")
+            return "snapshot"
+        end backupPasteboard
+
+        on writeCommandToPasteboard(commandText)
+            my recordEvent("set-command")
+            if commandText is not "/jobcan_touch" then error "unexpected command"
+        end writeCommandToPasteboard
+
+        on focusComposerAndPaste()
+            my recordEvent("paste")
+            if my failureStage is "paste" then error "synthetic paste failure"
+        end focusComposerAndPaste
+
+        on sendCommand()
+            my recordEvent("send")
+            if my failureStage is "send" then error "synthetic send failure"
+        end sendCommand
+
+        on restorePasteboard(snapshotValue)
+            my recordEvent("restore")
+            if snapshotValue is not "snapshot" then error "unexpected pasteboard snapshot"
+        end restorePasteboard
+
+        on releaseSingleRunGuard()
+            my recordEvent("release")
+        end releaseSingleRunGuard
+    end script
+
+    set expectedError to false
+    if scenarioName is "lock-unavailable" then
+        set fakeAdapter's lockAvailable to false
+    else if scenarioName is "readiness-unavailable" then
+        set fakeAdapter's composerReady to false
+    else if scenarioName is "paste-failure" then
+        set fakeAdapter's failureStage to "paste"
+        set expectedError to true
+    else if scenarioName is "send-failure" then
+        set fakeAdapter's failureStage to "send"
+        set expectedError to true
+    else if scenarioName is not "success" then
+        error "unknown scenario"
+    end if
+
+    set observedError to false
+    try
+        candidateScript's executeJobcanFlow(fakeAdapter)
+    on error
+        set observedError to true
+    end try
+
+    if observedError is not expectedError then error "unexpected flow error result"
+    return joinEvents(fakeAdapter's events)
+end run
+APPLESCRIPT
+
+trap 'rm -f "${expected_metadata:-}" "${actual_metadata:-}" "$prefix_file" "$compiled_script" "$validator_runner" "${flow_runner:-}"' EXIT
+
+event_count() {
+    local events="$1"
+    local event_name="$2"
+    awk -F',' -v target="$event_name" '{
+        count = 0
+        for (i = 1; i <= NF; i++) {
+            if ($i == target) count++
+        }
+        print count
+    }' <<< "$events"
+}
+
+assert_event_count() {
+    local events="$1"
+    local event_name="$2"
+    local expected_count="$3"
+    local actual_count
+    actual_count="$(event_count "$events" "$event_name")"
+    [ "$actual_count" -eq "$expected_count" ] || fail "scenario events '$events': $event_name count $actual_count, expected $expected_count"
+}
+
+assert_no_ui_send_side_effects() {
+    local events="$1"
+    assert_event_count "$events" activate 0
+    assert_event_count "$events" open 0
+    assert_event_count "$events" set-command 0
+    assert_event_count "$events" paste 0
+    assert_event_count "$events" send 0
+}
+
+run_flow_scenario() {
+    local scenario="$1"
+    osascript "$flow_runner" "$compiled_script" "$scenario"
+}
+
+lock_events="$(run_flow_scenario lock-unavailable)"
+assert_event_count "$lock_events" lock 1
+assert_no_ui_send_side_effects "$lock_events"
+
+readiness_events="$(run_flow_scenario readiness-unavailable)"
+assert_event_count "$readiness_events" lock 1
+assert_event_count "$readiness_events" wait 1
+assert_event_count "$readiness_events" set-command 0
+assert_event_count "$readiness_events" paste 0
+assert_event_count "$readiness_events" send 0
+assert_event_count "$readiness_events" release 1
+
+success_events="$(run_flow_scenario success)"
+assert_event_count "$success_events" lock 1
+assert_event_count "$success_events" wait 1
+assert_event_count "$success_events" backup 1
+assert_event_count "$success_events" set-command 1
+assert_event_count "$success_events" paste 1
+assert_event_count "$success_events" send 1
+assert_event_count "$success_events" restore 1
+assert_event_count "$success_events" release 1
+
+paste_failure_events="$(run_flow_scenario paste-failure)"
+assert_event_count "$paste_failure_events" set-command 1
+assert_event_count "$paste_failure_events" paste 1
+assert_event_count "$paste_failure_events" send 0
+assert_event_count "$paste_failure_events" restore 1
+assert_event_count "$paste_failure_events" release 1
+
+send_failure_events="$(run_flow_scenario send-failure)"
+assert_event_count "$send_failure_events" send 1
+assert_event_count "$send_failure_events" restore 1
+assert_event_count "$send_failure_events" release 1
+
+# Keep a supplementary source-level check for the actual Slack send adapter:
+# the production script must not retain the old Return + Cmd+Return fallback.
 return_send_count="$(grep -Ec '^[[:space:]]*key code[[:space:]]+36([[:space:]]|$)' "$SCRIPT_PATH" || true)"
 [ "$return_send_count" -le 1 ] || fail 'more than one Return-style send operation is present'
 
-if grep -Eq '^[[:space:]]*key code[[:space:]]+36[[:space:]]+using[[:space:]]+\{command down\}' "$SCRIPT_PATH"; then
+if grep -Eq '^[[:space:]]*key code[[:space:]]+36[[:space:]]+using[[:space:]]+\\{command down\\}' "$SCRIPT_PATH"; then
     fail 'Cmd+Return fallback send must not coexist with the primary send path'
 fi
 
-# Preserving only a string is insufficient: HIR-251 requires the general
-# pasteboard item/type structure to be saved before mutation and written back.
+# The real adapter must preserve general pasteboard items/types. The executable
+# orchestration scenarios above separately verify that restoration is invoked
+# on success and on controlled failures after pasteboard mutation.
 pasteboard_backup_line="$(grep -nE 'pasteboardItems' "$SCRIPT_PATH" | head -n 1 | cut -d: -f1 || true)"
 pasteboard_clear_line="$(grep -nE 'clearContents' "$SCRIPT_PATH" | head -n 1 | cut -d: -f1 || true)"
 pasteboard_restore_line="$(grep -nE 'writeObjects:' "$SCRIPT_PATH" | tail -n 1 | cut -d: -f1 || true)"
