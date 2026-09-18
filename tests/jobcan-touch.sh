@@ -92,12 +92,14 @@ END {
 }
 ' "$SCRIPT_PATH" > "$run_block_file" || fail 'could not extract production run handler'
 
-require_literal 'executeJobcanFlow' "$run_block_file"
+flow_call_count="$(awk '!/^[[:space:]]*--/ && index($0, "executeJobcanFlow") { count++ } END { print count + 0 }' "$run_block_file")"
+[ "$flow_call_count" -eq 1 ] || fail 'production run must call executeJobcanFlow exactly once'
+
 if grep -Eq 'tell application "Slack"|keystroke|key[[:space:]]+code|openURL:|clearContents|setString:' "$run_block_file"; then
     fail 'production run must delegate UI/pasteboard side effects through executeJobcanFlow'
 fi
 
-flow_call_line="$(grep -nF 'executeJobcanFlow' "$run_block_file" | head -n 1 | cut -d: -f1 || true)"
+flow_call_line="$(awk '!/^[[:space:]]*--/ && index($0, "executeJobcanFlow") { print NR; exit }' "$run_block_file")"
 [ -n "$flow_call_line" ] || fail 'production run does not call executeJobcanFlow'
 head -n "$((flow_call_line - 1))" "$run_block_file" > "$prefix_file"
 
@@ -196,12 +198,14 @@ on run argv
 
         on backupPasteboard()
             my recordEvent("backup")
+            if my failureStage is "backup" then error "synthetic backup failure"
             return "snapshot"
         end backupPasteboard
 
         on writeCommandToPasteboard(commandText)
             my recordEvent("set-command")
             if commandText is not "/jobcan_touch" then error "unexpected command"
+            if my failureStage is "set-command" then error "synthetic set-command failure"
         end writeCommandToPasteboard
 
         on focusComposerAndPaste()
@@ -229,6 +233,12 @@ on run argv
         set fakeAdapter's lockAvailable to false
     else if scenarioName is "readiness-unavailable" then
         set fakeAdapter's composerReady to false
+    else if scenarioName is "backup-failure" then
+        set fakeAdapter's failureStage to "backup"
+        set expectedError to true
+    else if scenarioName is "set-command-failure" then
+        set fakeAdapter's failureStage to "set-command"
+        set expectedError to true
     else if scenarioName is "paste-failure" then
         set fakeAdapter's failureStage to "paste"
         set expectedError to true
@@ -287,6 +297,8 @@ assert_events() {
 
 assert_events lock-unavailable 'lock'
 assert_events readiness-unavailable 'lock,activate,open,wait,release'
+assert_events backup-failure 'lock,activate,open,wait,backup,release'
+assert_events set-command-failure 'lock,activate,open,wait,backup,set-command,restore,release'
 assert_events success 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
 assert_events paste-failure 'lock,activate,open,wait,backup,set-command,paste,restore,release'
 assert_events send-failure 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
