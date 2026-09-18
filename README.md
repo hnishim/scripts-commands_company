@@ -21,12 +21,15 @@
 設定値は次の形式に限定されます。`YOUR_WORKSPACE_ID` と `YOUR_CONVERSATION_ID` は、実際の値をローカルの実行環境だけに設定します。
 
 ```sh
-export JOBCAN_SLACK_URL='slack://channel?team=YOUR_WORKSPACE_ID&id=YOUR_CONVERSATION_ID'
+launchctl setenv JOBCAN_SLACK_URL 'slack://channel?team=YOUR_WORKSPACE_ID&id=YOUR_CONVERSATION_ID'
 ```
 
 1. RaycastのScript Commandsとして `jobcan-touch.applescript` を登録します
-2. Raycastが利用する実行環境へ `JOBCAN_SLACK_URL` を設定します。設定ファイルや値そのものはGitへ追加しません
-3. Raycastから実行し、Slack Desktopの対象conversationで `/jobcan_touch` が送信されることを確認します
+2. Terminalで上記の `launchctl setenv` を実行し、Raycastが利用するユーザー環境へ `JOBCAN_SLACK_URL` を設定します。設定ファイルや値そのものはGitへ追加しません
+3. Raycastを終了して再起動します。起動済みのRaycastプロセスには、後から設定した環境変数は反映されません
+4. Raycastから実行し、Slack Desktopの対象conversationで `/jobcan_touch` が送信されることを確認します
+
+`launchctl setenv` は現在のユーザーセッションのlaunchd環境へ設定します。設定を解除する場合は、Terminalで `launchctl unsetenv JOBCAN_SLACK_URL` を実行してからRaycastを再起動してください。
 
 `JOBCAN_SLACK_URL` が未設定または形式不正の場合は、Slackをactivateせず、clipboardを変更せず送信せずに終了します。Raycastの実登録artifactとの対応、および実Slack／Jobcan経路は、候補ごとにmacOS上で確認してください。
 
