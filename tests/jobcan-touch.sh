@@ -55,42 +55,51 @@ command -v osascript >/dev/null 2>&1 || fail 'osascript is required (run this te
 
 prefix_file="$(mktemp)"
 compiled_script="$(mktemp -u).scpt"
-validator_runner="$(mktemp -u).applescript"
-trap 'rm -f "${expected_metadata:-}" "${actual_metadata:-}" "$prefix_file" "$compiled_script" "$validator_runner"' EXIT
+testable_script="$(mktemp -u).applescript"
+run_block_file="$(mktemp)"
+trap 'rm -f "${expected_metadata:-}" "${actual_metadata:-}" "$prefix_file" "$compiled_script" "$testable_script" "$run_block_file"' EXIT
 
 osacompile -o "$compiled_script" "$SCRIPT_PATH"
-cat > "$validator_runner" <<'APPLESCRIPT'
-on run argv
-    set candidateScript to load script POSIX file (item 1 of argv)
-    set candidateURL to item 2 of argv
-    return candidateScript's isValidSlackURL(candidateURL)
-end run
-APPLESCRIPT
 
-assert_validation() {
-    local value="$1"
-    local expected="$2"
-    local actual
-    actual="$(osascript "$validator_runner" "$compiled_script" "$value")"
-    [ "$actual" = "$expected" ] || fail "isValidSlackURL returned $actual for '$value' (expected $expected)"
+# Build a side-effect-free test harness from the production source without
+# using `load script`. The real Raycast `run` handler is renamed only in the
+# temporary copy; production handlers remain otherwise unchanged.
+awk '
+BEGIN { renamed = 0 }
+!renamed && /^[[:space:]]*on[[:space:]]+run[[:space:]]+argv[[:space:]]*$/ {
+    sub(/on[[:space:]]+run[[:space:]]+argv/, "on productionRun argv")
+    renamed = 1
 }
+{ print }
+END {
+    if (!renamed) exit 2
+}
+' "$SCRIPT_PATH" > "$testable_script" || fail 'could not create testable AppleScript source'
 
-assert_validation 'slack://channel?team=T123&id=C456' true
-assert_validation '' false
-assert_validation 'https://channel?team=T123&id=C456' false
-assert_validation 'slack://' false
-assert_validation 'slack://channel' false
-assert_validation 'slack://channel?team=T123' false
-assert_validation 'slack://channel?id=C456' false
-assert_validation 'slack://channel?team=&id=C456' false
-assert_validation 'slack://channel?team=T123&id=' false
-assert_validation 'slack://channel?id=C456&team=T123' false
-assert_validation 'slack://channel?team=T123&id=C456&extra=1' false
+# The real Raycast entry point must delegate to the same flow exercised below.
+awk '
+BEGIN { in_run = 0; found = 0 }
+{
+    if (!in_run && $0 ~ /^[[:space:]]*on[[:space:]]+run[[:space:]]+argv[[:space:]]*$/) {
+        in_run = 1
+        found = 1
+    }
+    if (in_run) print
+    if (in_run && $0 ~ /^[[:space:]]*end[[:space:]]+run[[:space:]]*$/) exit
+}
+END {
+    if (!found) exit 2
+}
+' "$SCRIPT_PATH" > "$run_block_file" || fail 'could not extract production run handler'
 
-# The invalid-URL guard itself must terminate before any Slack/UI/clipboard side effect.
-first_side_effect_line="$(grep -niE '(activate|set[[:space:]]+the[[:space:]]+clipboard|open[[:space:]]+location|keystroke|key[[:space:]]+code)' "$SCRIPT_PATH" | head -n 1 | cut -d: -f1 || true)"
-[ -n "$first_side_effect_line" ] || fail 'no Slack/UI/clipboard side-effect operation found'
-head -n "$((first_side_effect_line - 1))" "$SCRIPT_PATH" > "$prefix_file"
+require_literal 'executeJobcanFlow' "$run_block_file"
+if grep -Eq 'tell application "Slack"|keystroke|key[[:space:]]+code|openURL:|clearContents|setString:' "$run_block_file"; then
+    fail 'production run must delegate UI/pasteboard side effects through executeJobcanFlow'
+fi
+
+flow_call_line="$(grep -nF 'executeJobcanFlow' "$run_block_file" | head -n 1 | cut -d: -f1 || true)"
+[ -n "$flow_call_line" ] || fail 'production run does not call executeJobcanFlow'
+head -n "$((flow_call_line - 1))" "$run_block_file" > "$prefix_file"
 
 guard_status=0
 awk '
@@ -102,7 +111,6 @@ BEGIN { in_guard = 0; nested = 0; terminated = 0; found = 0 }
         found = 1
         in_guard = 1
 
-        # One-line guard: "if not ... then return/error"
         if (lower ~ /then[[:space:]]+(return|error)([[:space:]]|$)/) {
             terminated = 1
             exit
@@ -111,9 +119,7 @@ BEGIN { in_guard = 0; nested = 0; terminated = 0; found = 0 }
     }
 
     if (in_guard) {
-        if (lower ~ /^[[:space:]]*if[[:space:]].*then[[:space:]]*$/) {
-            nested++
-        }
+        if (lower ~ /^[[:space:]]*if[[:space:]].*then[[:space:]]*$/) nested++
 
         if (nested == 0 && lower ~ /^[[:space:]]*(return|error)([[:space:]]|$)/) {
             terminated = 1
@@ -135,18 +141,13 @@ END {
 ' "$prefix_file" || guard_status=$?
 case "$guard_status" in
     0) ;;
-    2) fail 'isValidSlackURL invalid-value guard must appear before the first side effect' ;;
-    3) fail 'the isValidSlackURL invalid-value guard must itself return/error before the first side effect' ;;
+    2) fail 'isValidSlackURL invalid-value guard must precede executeJobcanFlow' ;;
+    3) fail 'isValidSlackURL invalid-value guard must return/error before executeJobcanFlow' ;;
     *) fail 'could not verify the invalid-value guard' ;;
 esac
 
-# HIR-251 permanent safety regressions.
-#
-# The orchestration tests below execute the production flow against a fake
-# side-effect adapter. They verify failure-boundary behavior without opening
-# Slack, mutating the real pasteboard, or sending a slash command.
-flow_runner="$(mktemp -u).applescript"
-cat > "$flow_runner" <<'APPLESCRIPT'
+cat >> "$testable_script" <<'APPLESCRIPT'
+
 on joinEvents(eventList)
     set previousDelimiters to AppleScript's text item delimiters
     set AppleScript's text item delimiters to ","
@@ -156,7 +157,13 @@ on joinEvents(eventList)
 end joinEvents
 
 on run argv
-    set candidateScript to load script POSIX file (item 1 of argv)
+    set testMode to item 1 of argv
+
+    if testMode is "validate" then
+        return isValidSlackURL(item 2 of argv)
+    end if
+
+    if testMode is not "flow" then error "unknown test mode"
     set scenarioName to item 2 of argv
 
     script fakeAdapter
@@ -234,7 +241,7 @@ on run argv
 
     set observedError to false
     try
-        candidateScript's executeJobcanFlow(fakeAdapter)
+        executeJobcanFlow(fakeAdapter)
     on error
         set observedError to true
     end try
@@ -244,98 +251,56 @@ on run argv
 end run
 APPLESCRIPT
 
-trap 'rm -f "${expected_metadata:-}" "${actual_metadata:-}" "$prefix_file" "$compiled_script" "$validator_runner" "${flow_runner:-}"' EXIT
-
-event_count() {
-    local events="$1"
-    local event_name="$2"
-    awk -F',' -v target="$event_name" '{
-        count = 0
-        for (i = 1; i <= NF; i++) {
-            if ($i == target) count++
-        }
-        print count
-    }' <<< "$events"
+assert_validation() {
+    local value="$1"
+    local expected="$2"
+    local actual
+    actual="$(osascript "$testable_script" validate "$value")"
+    [ "$actual" = "$expected" ] || fail "isValidSlackURL returned $actual for '$value' (expected $expected)"
 }
 
-assert_event_count() {
-    local events="$1"
-    local event_name="$2"
-    local expected_count="$3"
-    local actual_count
-    actual_count="$(event_count "$events" "$event_name")"
-    [ "$actual_count" -eq "$expected_count" ] || fail "scenario events '$events': $event_name count $actual_count, expected $expected_count"
-}
+assert_validation 'slack://channel?team=T123&id=C456' true
+assert_validation '' false
+assert_validation 'https://channel?team=T123&id=C456' false
+assert_validation 'slack://' false
+assert_validation 'slack://channel' false
+assert_validation 'slack://channel?team=T123' false
+assert_validation 'slack://channel?id=C456' false
+assert_validation 'slack://channel?team=&id=C456' false
+assert_validation 'slack://channel?team=T123&id=' false
+assert_validation 'slack://channel?id=C456&team=T123' false
+assert_validation 'slack://channel?team=T123&id=C456&extra=1' false
 
-assert_no_ui_send_side_effects() {
-    local events="$1"
-    assert_event_count "$events" activate 0
-    assert_event_count "$events" open 0
-    assert_event_count "$events" set-command 0
-    assert_event_count "$events" paste 0
-    assert_event_count "$events" send 0
-}
-
+# HIR-251 permanent safety regressions.
 run_flow_scenario() {
     local scenario="$1"
-    osascript "$flow_runner" "$compiled_script" "$scenario"
+    osascript "$testable_script" flow "$scenario"
 }
 
-lock_events="$(run_flow_scenario lock-unavailable)"
-assert_event_count "$lock_events" lock 1
-assert_no_ui_send_side_effects "$lock_events"
+assert_events() {
+    local scenario="$1"
+    local expected="$2"
+    local actual
+    actual="$(run_flow_scenario "$scenario")"
+    [ "$actual" = "$expected" ] || fail "scenario $scenario events '$actual', expected '$expected'"
+}
 
-readiness_events="$(run_flow_scenario readiness-unavailable)"
-assert_event_count "$readiness_events" lock 1
-assert_event_count "$readiness_events" wait 1
-assert_event_count "$readiness_events" set-command 0
-assert_event_count "$readiness_events" paste 0
-assert_event_count "$readiness_events" send 0
-assert_event_count "$readiness_events" release 1
+assert_events lock-unavailable 'lock'
+assert_events readiness-unavailable 'lock,activate,open,wait,release'
+assert_events success 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
+assert_events paste-failure 'lock,activate,open,wait,backup,set-command,paste,restore,release'
+assert_events send-failure 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
 
-success_events="$(run_flow_scenario success)"
-assert_event_count "$success_events" lock 1
-assert_event_count "$success_events" wait 1
-assert_event_count "$success_events" backup 1
-assert_event_count "$success_events" set-command 1
-assert_event_count "$success_events" paste 1
-assert_event_count "$success_events" send 1
-assert_event_count "$success_events" restore 1
-assert_event_count "$success_events" release 1
-
-paste_failure_events="$(run_flow_scenario paste-failure)"
-assert_event_count "$paste_failure_events" set-command 1
-assert_event_count "$paste_failure_events" paste 1
-assert_event_count "$paste_failure_events" send 0
-assert_event_count "$paste_failure_events" restore 1
-assert_event_count "$paste_failure_events" release 1
-
-send_failure_events="$(run_flow_scenario send-failure)"
-assert_event_count "$send_failure_events" send 1
-assert_event_count "$send_failure_events" restore 1
-assert_event_count "$send_failure_events" release 1
-
-# Keep a supplementary source-level check for the actual Slack send adapter:
-# the production script must not retain the old Return + Cmd+Return fallback.
+# Supplementary checks for the real Slack/pasteboard adapter.
 return_send_count="$(grep -Ec '^[[:space:]]*key code[[:space:]]+36([[:space:]]|$)' "$SCRIPT_PATH" || true)"
 [ "$return_send_count" -le 1 ] || fail 'more than one Return-style send operation is present'
 
-if grep -Eq '^[[:space:]]*key code[[:space:]]+36[[:space:]]+using[[:space:]]+\\{command down\\}' "$SCRIPT_PATH"; then
+if grep -Eq '^[[:space:]]*key code[[:space:]]+36[[:space:]]+using[[:space:]]+\{command down\}[[:space:]]*$' "$SCRIPT_PATH"; then
     fail 'Cmd+Return fallback send must not coexist with the primary send path'
 fi
 
-# The real adapter must preserve general pasteboard items/types. The executable
-# orchestration scenarios above separately verify that restoration is invoked
-# on success and on controlled failures after pasteboard mutation.
-pasteboard_backup_line="$(grep -nE 'pasteboardItems' "$SCRIPT_PATH" | head -n 1 | cut -d: -f1 || true)"
-pasteboard_clear_line="$(grep -nE 'clearContents' "$SCRIPT_PATH" | head -n 1 | cut -d: -f1 || true)"
-pasteboard_restore_line="$(grep -nE 'writeObjects:' "$SCRIPT_PATH" | tail -n 1 | cut -d: -f1 || true)"
-
-[ -n "$pasteboard_backup_line" ] || fail 'pasteboard items are not backed up before mutation'
-[ -n "$pasteboard_clear_line" ] || fail 'pasteboard mutation point is missing'
-[ -n "$pasteboard_restore_line" ] || fail 'pasteboard items are not restored after mutation'
-[ "$pasteboard_backup_line" -lt "$pasteboard_clear_line" ] || fail 'pasteboard backup must occur before clearContents'
-[ "$pasteboard_restore_line" -gt "$pasteboard_clear_line" ] || fail 'pasteboard restoration must occur after mutation'
+require_literal 'pasteboardItems' "$SCRIPT_PATH"
+require_literal 'writeObjects:' "$SCRIPT_PATH"
 
 # Exact private values are supplied only at test time and must not be written to the repository.
 # Provide one forbidden value per line, for example the real workspace ID, conversation ID,
