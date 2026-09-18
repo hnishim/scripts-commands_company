@@ -97,9 +97,12 @@ on run argv
     workspaceObject's openURL:slackURLObject
     delay 0.5
 
+    set pasteboard to current application's NSPasteboard's generalPasteboard()
+    pasteboard's clearContents()
+    pasteboard's setString:"/jobcan_touch" forType:(current application's NSPasteboardTypeString)
+
     tell application "System Events"
         keystroke "a" using {command down}
-        set the clipboard to "/jobcan_touch"
         keystroke "v" using {command down}
         delay 0.5
         key code 36
