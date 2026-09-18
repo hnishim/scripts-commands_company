@@ -67,7 +67,7 @@ osacompile -o "$compiled_script" "$SCRIPT_PATH"
 awk '
 BEGIN { renamed = 0 }
 !renamed && /^[[:space:]]*on[[:space:]]+run[[:space:]]+argv[[:space:]]*$/ {
-    sub(/on[[:space:]]+run[[:space:]]+argv/, "on productionRun argv")
+    sub(/on[[:space:]]+run[[:space:]]+argv/, "on productionRun(argv)")
     renamed = 1
 }
 { print }
@@ -172,10 +172,10 @@ on run argv
         property lockAvailable : true
         property composerReady : true
         property failureStage : ""
-        property events : {}
+        property eventLog : {}
 
         on recordEvent(eventName)
-            set my events to my events & {eventName}
+            set my eventLog to my eventLog & {eventName}
         end recordEvent
 
         on acquireSingleRunGuard()
@@ -257,7 +257,7 @@ on run argv
     end try
 
     if observedError is not expectedError then error "unexpected flow error result"
-    return joinEvents(fakeAdapter's events)
+    return joinEvents(fakeAdapter's eventLog)
 end run
 APPLESCRIPT
 
