@@ -98,6 +98,7 @@ on run argv
     delay 0.5
 
     tell application "System Events"
+        keystroke "a" using {command down}
         set the clipboard to "/jobcan_touch"
         keystroke "v" using {command down}
         delay 0.5
