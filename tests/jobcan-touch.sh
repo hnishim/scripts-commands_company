@@ -28,8 +28,17 @@ require_literal '@raycast.title' "$SCRIPT_PATH"
 require_literal '@raycast.mode' "$SCRIPT_PATH"
 require_literal '@raycast.description' "$SCRIPT_PATH"
 require_literal '/jobcan_touch' "$SCRIPT_PATH"
-require_literal 'JOBCAN_SLACK_URL' "$SCRIPT_PATH"
-require_literal 'JOBCAN_SLACK_URL' "$README_PATH"
+# HIR-285: Keychain is the sole source; failures must never use the old environment.
+require_literal 'my.slack.url-dm-myself' "$SCRIPT_PATH"
+require_literal 'find-generic-password' "$SCRIPT_PATH"
+require_literal '/usr/bin/security' "$SCRIPT_PATH"
+require_literal '"-s"' "$SCRIPT_PATH"
+require_literal '"-a"' "$SCRIPT_PATH"
+require_literal '"my"' "$SCRIPT_PATH"
+require_literal 'Keychain' "$README_PATH"
+if grep -Eq 'NSProcessInfo|launchdEnvironmentValue|launchctl|getenv|objectForKey:"JOBCAN_SLACK_URL"' "$SCRIPT_PATH"; then
+    fail 'legacy Slack URL environment lookup remains in production source'
+fi
 
 if [ -n "${JOBCAN_METADATA_REFERENCE:-}" ]; then
     [ -f "$JOBCAN_METADATA_REFERENCE" ] || fail 'JOBCAN_METADATA_REFERENCE does not exist'
@@ -92,61 +101,22 @@ END {
 }
 ' "$SCRIPT_PATH" > "$run_block_file" || fail 'could not extract production run handler'
 
-flow_call_count="$(awk '!/^[[:space:]]*--/ && index($0, "executeJobcanFlow") { count++ } END { print count + 0 }' "$run_block_file")"
-[ "$flow_call_count" -eq 1 ] || fail 'production run must call executeJobcanFlow exactly once'
+flow_call_count="$(awk '!/^[[:space:]]*--/ && index($0, "runJobcanWithProvider") { count++ } END { print count + 0 }' "$run_block_file")"
+[ "$flow_call_count" -eq 1 ] || fail 'production run must delegate to the tested URL-provider gate exactly once'
+require_literal 'keychainURLProvider' "$run_block_file"
 
 if grep -Eq 'tell application "Slack"|keystroke|key[[:space:]]+code|openURL:|clearContents|setString:' "$run_block_file"; then
-    fail 'production run must delegate UI/pasteboard side effects through executeJobcanFlow'
+    fail 'production run must delegate UI/pasteboard side effects through the tested entry gate'
 fi
 
-flow_call_line="$(awk '!/^[[:space:]]*--/ && index($0, "executeJobcanFlow") { print NR; exit }' "$run_block_file")"
+flow_call_line="$(awk '!/^[[:space:]]*--/ && index($0, "runJobcanWithProvider") { print NR; exit }' "$run_block_file")"
 [ -n "$flow_call_line" ] || fail 'production run does not call executeJobcanFlow'
 head -n "$((flow_call_line - 1))" "$run_block_file" > "$prefix_file"
 
-guard_status=0
-awk '
-BEGIN { in_guard = 0; nested = 0; terminated = 0; found = 0 }
-{
-    lower = tolower($0)
-
-    if (!in_guard && lower ~ /if[[:space:]]+not[[:space:]]+isvalidslackurl[[:space:]]*\(/) {
-        found = 1
-        in_guard = 1
-
-        if (lower ~ /then[[:space:]]+(return|error)([[:space:]]|$)/) {
-            terminated = 1
-            exit
-        }
-        next
-    }
-
-    if (in_guard) {
-        if (lower ~ /^[[:space:]]*if[[:space:]].*then[[:space:]]*$/) nested++
-
-        if (nested == 0 && lower ~ /^[[:space:]]*(return|error)([[:space:]]|$)/) {
-            terminated = 1
-        }
-
-        if (lower ~ /^[[:space:]]*end[[:space:]]+if[[:space:]]*$/) {
-            if (nested > 0) {
-                nested--
-            } else {
-                exit
-            }
-        }
-    }
-}
-END {
-    if (!found) exit 2
-    if (!terminated) exit 3
-}
-' "$prefix_file" || guard_status=$?
-case "$guard_status" in
-    0) ;;
-    2) fail 'isValidSlackURL invalid-value guard must precede executeJobcanFlow' ;;
-    3) fail 'isValidSlackURL invalid-value guard must return/error before executeJobcanFlow' ;;
-    *) fail 'could not verify the invalid-value guard' ;;
-esac
+# The real run delegates to the separately tested entry gate; only that gate
+# may continue to executeJobcanFlow after successfully validating the URL.
+require_literal 'runJobcanWithProvider' "$SCRIPT_PATH"
+require_literal 'isValidSlackURL' "$SCRIPT_PATH"
 
 cat >> "$testable_script" <<'APPLESCRIPT'
 
@@ -165,10 +135,11 @@ on run argv
         return isValidSlackURL(item 2 of argv)
     end if
 
-    if testMode is not "flow" then error "unknown test mode"
+    if testMode is not "flow" and testMode is not "entry" then error "unknown test mode"
     set scenarioName to item 2 of argv
 
     script fakeAdapter
+        property configuredSlackURL : ""
         property lockAvailable : true
         property composerReady : true
         property failureStage : ""
@@ -228,6 +199,40 @@ on run argv
         end releaseSingleRunGuard
     end script
 
+    -- The provider is a test-only replacement for Keychain; no real Slack is invoked.
+    if testMode is "entry" then
+        script fakeURLProvider
+            property suppliedURL : ""
+            property denyRead : false
+
+            on readSlackURL()
+                if my denyRead then error "synthetic Keychain read failure"
+                return my suppliedURL
+            end readSlackURL
+        end script
+
+        if scenarioName is "success" then
+            set fakeURLProvider's suppliedURL to "slack://channel?team=T123&id=C456"
+        else if scenarioName is "missing" or scenarioName is "access-denied" then
+            set fakeURLProvider's denyRead to true
+        else if scenarioName is "empty" or scenarioName is "legacy-only" then
+            set fakeURLProvider's suppliedURL to ""
+        else if scenarioName is "malformed" then
+            set fakeURLProvider's suppliedURL to "slack://channel?team=T123&id=C456&extra=1"
+        else
+            error "unknown entry scenario"
+        end if
+
+        set observedError to false
+        try
+            runJobcanWithProvider(fakeAdapter, fakeURLProvider)
+        on error
+            set observedError to true
+        end try
+        if observedError then error "provider failure must not leak to the caller"
+        return joinEvents(fakeAdapter's eventLog)
+    end if
+
     set expectedError to false
     if scenarioName is "lock-unavailable" then
         set fakeAdapter's lockAvailable to false
@@ -280,6 +285,22 @@ assert_validation 'slack://channel?team=&id=C456' false
 assert_validation 'slack://channel?team=T123&id=' false
 assert_validation 'slack://channel?id=C456&team=T123' false
 assert_validation 'slack://channel?team=T123&id=C456&extra=1' false
+
+# HIR-285 permanent safety regressions: the same production gate is exercised
+# with a test-only URL provider and a test-only UI adapter.
+assert_entry_events() {
+    local scenario="$1"
+    local expected="$2"
+    local actual
+    actual="$(osascript "$testable_script" entry "$scenario")"
+    [ "$actual" = "$expected" ] || fail "entry scenario $scenario events '$actual', expected '$expected'"
+}
+assert_entry_events success 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
+assert_entry_events missing ''
+assert_entry_events access-denied ''
+assert_entry_events empty ''
+assert_entry_events malformed ''
+JOBCAN_SLACK_URL='slack://channel?team=T123&id=C456' assert_entry_events legacy-only ''
 
 # HIR-251 permanent safety regressions.
 run_flow_scenario() {
