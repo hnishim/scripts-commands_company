@@ -4,7 +4,7 @@
 
 | Script Command | 機能 | 認証 |
 | --- | --- | --- |
-| `jobcan-touch.applescript` | Slack Desktopの対象conversationへJobcanのslash commandを送信 | `JOBCAN_SLACK_URL` |
+| `jobcan-touch.applescript` | Slack Desktopの対象conversationへJobcanのslash commandを送信 | macOS Keychain |
 | `google-drive_active-document-link-copier_gdrivefs.sh` | 最前面で開いているGoogle DriveファイルのURLをクリップボードへコピー | 不要 |
 | `google-drive-path-generator.sh` | クリップボード上のGoogle Drive URLに対応するローカル項目を開く | Google Drive API OAuth |
 
@@ -16,22 +16,39 @@
 
 ## Jobcan touch
 
-`jobcan-touch.applescript` はSlack Desktopを開き、対象conversationへ `/jobcan_touch` を送信するRaycast Script Commandです。Slackのworkspace／conversation固有値は公開repositoryへ保存せず、Raycastの実行環境で `JOBCAN_SLACK_URL` として設定してください。
+`jobcan-touch.applescript` はSlack Desktopで自分宛DMを開き、`/jobcan_touch` を送信するRaycast Script Commandです。送信先URLはmacOSのログインキーチェーンの**汎用パスワード**項目だけから取得します。URLの実値や会話識別子は公開リポジトリ、コマンド履歴、ログ、テストに記録しません。
 
-設定値は次の形式に限定されます。`YOUR_WORKSPACE_ID` と `YOUR_CONVERSATION_ID` は、実際の値をローカルの実行環境だけに設定します。
+- Service（キーチェーンアクセスの「キーチェーン項目名」）：`my.slack.url-dm-myself`
+- Account（「アカウント名」）：`my`
+- パスワード：対象の自分宛DMのSlack URL（`slack://channel?team=＜ワークスペース識別子＞&id=＜会話識別子＞` 形式）。実値はこの項目のパスワード欄だけに入力します。
+
+### 登録・確認・更新・削除
+
+1. macOSの「キーチェーンアクセス」でログインキーチェーンを選び、上記の項目名とアカウント名の汎用パスワード項目が既にないか確認します。既存項目がある場合は用途と内容の衝突を確認し、無断で上書きしません。
+2. 存在しない場合は「新規パスワード項目」を作成し、上記の項目名・アカウント名・パスワードを対話的に登録します。URLを `security add-generic-password -w ...` の引数、シェル履歴、設定ファイルへ書かないでください。
+3. 登録後、Terminalで次の確認コマンドを実行できます。取得値とエラー出力は破棄され、URLは表示されません。終了状態が成功でも、URL形式・送信先の正しさは後述のRaycast実機確認が必要です。
 
 ```sh
-launchctl setenv JOBCAN_SLACK_URL 'slack://channel?team=YOUR_WORKSPACE_ID&id=YOUR_CONVERSATION_ID'
+if /usr/bin/security find-generic-password -w -s my.slack.url-dm-myself -a my >/dev/null 2>&1; then
+    printf '%s\n' 'Keychain項目を読み取れました'
+else
+    printf '%s\n' 'Keychain項目を読み取れませんでした'
+fi
 ```
 
-1. RaycastのScript Commandsとして `jobcan-touch.applescript` を登録します
-2. Terminalで上記の `launchctl setenv` を実行し、Raycastが利用するユーザー環境へ `JOBCAN_SLACK_URL` を設定します。設定ファイルや値そのものはGitへ追加しません
-3. Raycastを終了して再起動します。起動済みのRaycastプロセスには、後から設定した環境変数は反映されません
-4. Raycastから実行し、Slack Desktopの対象conversationで `/jobcan_touch` が送信されることを確認します
+4. 更新時はキーチェーンアクセスで対象項目を開き、用途・送信先を確認してパスワード欄を編集します。削除時は同じService／Accountの項目だけを選んで削除します。いずれもURLの実値をターミナル、Git、Linearへ転記しません。
 
-`launchctl setenv` は現在のユーザーセッションのlaunchd環境へ設定します。設定を解除する場合は、Terminalで `launchctl unsetenv JOBCAN_SLACK_URL` を実行してからRaycastを再起動してください。
+### Raycastでの受入・旧設定の撤去
 
-`JOBCAN_SLACK_URL` が未設定または形式不正の場合は、Slackをactivateせず、clipboardを変更せず送信せずに終了します。Raycastの実登録artifactとの対応、および実Slack／Jobcan経路は、候補ごとにmacOS上で確認してください。
+1. Raycastに `jobcan-touch.applescript` を登録し、実行時にキーチェーンのアクセス許可が表示された場合は、要求元アプリと対象項目を確認した上で許可します。Terminalでの読み取り許可とRaycast経由の許可は同一ではありません。許可を拒否した場合や項目が見つからない場合は、Slackを起動・操作せず終了する設計です。
+2. 旧環境変数が残っている段階でKeychainの値だけによる送信先の一致、意図した1回の `/jobcan_touch` 送信、クリップボード復元をmacOS実機で確認します。実送信を伴うため実行回数を管理してください。未登録・拒否・不正値の無副作用は、安全な検証環境または設定を退避した状態で確認してください。
+3. 正常なRaycast実行を確認した**後**、旧設定を解除してRaycastを再起動します。旧設定は取得元として利用されません。
+
+```sh
+launchctl unsetenv JOBCAN_SLACK_URL
+```
+
+プロセス環境変数や別の永続化設定に `JOBCAN_SLACK_URL` が残っている場合も、ローカルで確認して撤去してください。旧設定を撤去した後にRaycastから再実行し、Keychainだけで正常動作することを確認します。macOSのAppleScriptコンパイル、Keychainの実アクセス許可、Slackの実送信はリモート環境では確認できません。
 
 ## Copy Active Document Google Drive Link
 
