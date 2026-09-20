@@ -280,14 +280,16 @@ script productionAdapter
                 if targetHTML is missing value then return missing value
                 if my hasBlockingModal(slackWindow) then return missing value
 
-                set composers to every UI element of entire contents of targetHTML whose role description is "text entry area"
+                set composers to entire contents of targetHTML
                 set matchingComposers to {}
                 repeat with composerCandidate in composers
                     try
-                        set composerDescription to description of composerCandidate
-                        set editableValue to value of attribute "AXEditable" of composerCandidate
-                        set enabledValue to value of attribute "AXEnabled" of composerCandidate
-                        if (composerDescription starts with "Message to ") and editableValue and enabledValue then set end of matchingComposers to contents of composerCandidate
+                        if (role description of composerCandidate) is "text entry area" then
+                            set composerDescription to description of composerCandidate
+                            set editableValue to value of attribute "AXEditable" of composerCandidate
+                            set enabledValue to value of attribute "AXEnabled" of composerCandidate
+                            if (composerDescription starts with "Message to ") and editableValue and enabledValue then set end of matchingComposers to contents of composerCandidate
+                        end if
                     end try
                 end repeat
 
@@ -300,11 +302,13 @@ script productionAdapter
     on findTargetHTML(slackWindow)
         tell application "System Events"
             tell process "Slack"
-                set htmlCandidates to every UI element of entire contents of slackWindow whose role description is "HTML content"
+                set htmlCandidates to entire contents of slackWindow
                 repeat with htmlCandidate in htmlCandidates
                     try
-                        set candidateURL to (value of attribute "AXURL" of htmlCandidate) as text
-                        if candidateURL contains ("/client/" & my workspaceIdentifier & "/" & my conversationIdentifier) then return contents of htmlCandidate
+                        if (role description of htmlCandidate) is "HTML content" then
+                            set candidateURL to (value of attribute "AXURL" of htmlCandidate) as text
+                            if candidateURL contains ("/client/" & my workspaceIdentifier & "/" & my conversationIdentifier) then return contents of htmlCandidate
+                        end if
                     end try
                 end repeat
                 return missing value
@@ -315,9 +319,13 @@ script productionAdapter
     on hasBlockingModal(slackWindow)
         tell application "System Events"
             tell process "Slack"
-                set dialogs to every UI element of entire contents of slackWindow whose role description is "dialog"
-                set sheets to every sheet of slackWindow
-                return ((count of dialogs) is greater than 0) or ((count of sheets) is greater than 0)
+                set dialogCandidates to entire contents of slackWindow
+                repeat with dialogCandidate in dialogCandidates
+                    try
+                        if (role description of dialogCandidate) is "dialog" then return true
+                    end try
+                end repeat
+                return (count of (every sheet of slackWindow)) is greater than 0
             end tell
         end tell
     end hasBlockingModal
@@ -329,8 +337,14 @@ script productionAdapter
                 repeat 5 times
                     try
                         set currentParent to parent of currentParent
-                        set sendButtons to every button of entire contents of currentParent whose description is "Send now"
-                        if (count of sendButtons) is 1 then return item 1 of sendButtons
+                        set buttonCandidates to entire contents of currentParent
+                        set matchingButtons to {}
+                        repeat with buttonCandidate in buttonCandidates
+                            try
+                                if (role of buttonCandidate) is "AXButton" and (description of buttonCandidate) is "Send now" then set end of matchingButtons to contents of buttonCandidate
+                            end try
+                        end repeat
+                        if (count of matchingButtons) is 1 then return item 1 of matchingButtons
                     on error
                         exit repeat
                     end try
