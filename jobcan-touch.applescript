@@ -286,9 +286,12 @@ script productionAdapter
                     try
                         if (role description of composerCandidate) is "text entry area" then
                             set composerDescription to description of composerCandidate
-                            set editableValue to value of attribute "AXEditable" of composerCandidate
-                            set enabledValue to value of attribute "AXEnabled" of composerCandidate
-                            if (composerDescription starts with "Message to ") and editableValue and enabledValue then set end of matchingComposers to contents of composerCandidate
+                            -- Slack's current desktop client exposes the DM composer as
+                            -- a settable text entry area, but does not consistently expose
+                            -- AXEditable/AXEnabled through System Events.  The stable
+                            -- role/description pair is sufficient; focusability is checked
+                            -- immediately before pasting.
+                            if (composerDescription starts with "Message to ") then set end of matchingComposers to contents of composerCandidate
                         end if
                     end try
                 end repeat
