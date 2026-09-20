@@ -285,7 +285,8 @@ script productionAdapter
                 -- raises -1700 when its descendants are traversed directly,
                 -- so enumerate the already validated window instead.
                 set composers to entire contents of slackWindow
-                set matchingComposers to {}
+                set matchingComposerCount to 0
+                set matchingComposer to missing value
                 repeat with composerReference in composers
                     set composerCandidate to contents of composerReference
                     try
@@ -296,13 +297,16 @@ script productionAdapter
                             -- AXEditable/AXEnabled through System Events.  The stable
                             -- role/description pair is sufficient; focusability is checked
                             -- immediately before pasting.
-                            if (composerDescription starts with "Message to ") then set end of matchingComposers to contents of composerCandidate
+                            if (composerDescription starts with "Message to ") then
+                                set matchingComposerCount to matchingComposerCount + 1
+                                set matchingComposer to composerCandidate
+                            end if
                         end if
                     end try
                 end repeat
 
-                if (count of matchingComposers) is not 1 then return missing value
-                return item 1 of matchingComposers
+                if matchingComposerCount is not 1 then return missing value
+                return matchingComposer
             end tell
         end tell
     end findTargetComposer
