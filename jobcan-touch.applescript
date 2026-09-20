@@ -271,70 +271,91 @@ script productionAdapter
         end if
     end releaseSingleRunGuard
 
-    on findTargetComposer()
-        tell application "System Events"
-            tell process "Slack"
-                if (count of windows) is 0 then return missing value
-                set slackWindow to window 1
-                set targetHTML to my findTargetHTML(slackWindow)
-                if targetHTML is missing value then return missing value
-                if my hasBlockingModal(slackWindow) then return missing value
+	on findTargetComposer()
+		tell application "System Events"
+			tell process "Slack"
+				if (count of windows) is 0 then return missing value
+				set slackWindow to window 1
 
-                set composers to every UI element of entire contents of targetHTML whose role description is "text entry area"
-                set matchingComposers to {}
-                repeat with composerCandidate in composers
-                    try
-                        set composerDescription to description of composerCandidate
-                        set editableValue to value of attribute "AXEditable" of composerCandidate
-                        set enabledValue to value of attribute "AXEnabled" of composerCandidate
-                        if (composerDescription starts with "Message to ") and editableValue and enabledValue then set end of matchingComposers to contents of composerCandidate
-                    end try
-                end repeat
+				-- Slack's current AX tree rejects filtered descendant queries with
+				-- -1700/-1728. Take one snapshot and inspect its stable role and
+				-- description values instead. This does not read or mutate content.
+				set windowContents to entire contents of slackWindow
+				set htmlCount to 0
+				set dialogCount to 0
+				set matchingComposerCount to 0
+				set matchingComposer to missing value
+				repeat with elementReference in windowContents
+					set composerCandidate to contents of elementReference
+					try
+						set candidateRoleDescription to role description of composerCandidate
+						if candidateRoleDescription is "HTML content" then
+							set htmlCount to htmlCount + 1
+						else if candidateRoleDescription is "dialog" then
+							set dialogCount to dialogCount + 1
+						else if candidateRoleDescription is "text entry area" then
+							set composerDescription to description of composerCandidate
+							if composerDescription starts with "Message to " then
+								set matchingComposerCount to matchingComposerCount + 1
+								set matchingComposer to composerCandidate
+							end if
+						end if
+					end try
+				end repeat
 
-                if (count of matchingComposers) is not 1 then return missing value
-                return item 1 of matchingComposers
-            end tell
-        end tell
-    end findTargetComposer
+				if htmlCount is not 1 then return missing value
+				if dialogCount is greater than 0 then return missing value
+				if matchingComposerCount is not 1 then return missing value
+				return matchingComposer
+			end tell
+		end tell
+	end findTargetComposer
 
-    on findTargetHTML(slackWindow)
-        tell application "System Events"
-            tell process "Slack"
-                set htmlCandidates to every UI element of entire contents of slackWindow whose role description is "HTML content"
-                repeat with htmlCandidate in htmlCandidates
-                    try
-                        set candidateURL to (value of attribute "AXURL" of htmlCandidate) as text
-                        if candidateURL contains ("/client/" & my workspaceIdentifier & "/" & my conversationIdentifier) then return contents of htmlCandidate
-                    end try
-                end repeat
-                return missing value
-            end tell
-        end tell
+	on findTargetHTML(slackWindow)
+		tell application "System Events"
+			tell process "Slack"
+				set windowContents to entire contents of slackWindow
+				set htmlCount to 0
+				set matchingHTML to missing value
+				repeat with htmlReference in windowContents
+					set htmlCandidate to contents of htmlReference
+					try
+						if (role description of htmlCandidate) is "HTML content" then
+							set htmlCount to htmlCount + 1
+							set matchingHTML to htmlCandidate
+						end if
+					end try
+				end repeat
+				if htmlCount is 1 then return matchingHTML
+				return missing value
+			end tell
+		end tell
     end findTargetHTML
 
-    on hasBlockingModal(slackWindow)
-        tell application "System Events"
-            tell process "Slack"
-                set dialogs to every UI element of entire contents of slackWindow whose role description is "dialog"
-                set sheets to every sheet of slackWindow
-                return ((count of dialogs) is greater than 0) or ((count of sheets) is greater than 0)
-            end tell
-        end tell
+	on hasBlockingModal(slackWindow)
+		tell application "System Events"
+			tell process "Slack"
+				set windowContents to entire contents of slackWindow
+				repeat with elementReference in windowContents
+					try
+						if (role description of (contents of elementReference)) is "dialog" then return true
+					end try
+				end repeat
+				return (count of sheets of slackWindow) is greater than 0
+			end tell
+		end tell
     end hasBlockingModal
 
-    on findSendButton(composer)
-        tell application "System Events"
-            tell process "Slack"
-                set currentParent to composer
-                repeat 5 times
-                    try
-                        set currentParent to parent of currentParent
-                        set sendButtons to every button of entire contents of currentParent whose description is "Send now"
-                        if (count of sendButtons) is 1 then return item 1 of sendButtons
-                    on error
-                        exit repeat
-                    end try
-                end repeat
+	on findSendButton(composer)
+		tell application "System Events"
+			tell process "Slack"
+				set buttonCandidates to entire contents of window 1
+				repeat with buttonReference in buttonCandidates
+					set buttonCandidate to contents of buttonReference
+					try
+						if (role description of buttonCandidate) is "button" and (description of buttonCandidate) is "Send now" then return buttonCandidate
+					end try
+				end repeat
                 return missing value
             end tell
         end tell
