@@ -209,9 +209,8 @@ script productionAdapter
     end writeCommandToPasteboard
 
     on focusComposerAndPaste()
-        set currentComposer to my findTargetComposer()
+        set currentComposer to my composerElement
         if currentComposer is missing value then error "target composer is no longer ready"
-        set my composerElement to currentComposer
 
         tell application "System Events"
             tell process "Slack"
@@ -224,7 +223,7 @@ script productionAdapter
     end focusComposerAndPaste
 
     on sendCommand()
-        set currentComposer to my findTargetComposer()
+        set currentComposer to my composerElement
         if currentComposer is missing value then error "target composer is no longer ready"
         set sendButton to my findSendButton(currentComposer)
         if sendButton is missing value then error "target Slack send button is not available"
@@ -276,94 +275,64 @@ script productionAdapter
             tell process "Slack"
                 if (count of windows) is 0 then return missing value
                 set slackWindow to window 1
-                set targetHTML to my findTargetHTML(slackWindow)
-                if targetHTML is missing value then return missing value
-                if my hasBlockingModal(slackWindow) then return missing value
-
-                -- The target HTML element is used to bind this run to the
-                -- Keychain-configured conversation. Slack's current AX tree
-                -- raises -1700 when its descendants are traversed directly,
-                -- so enumerate the already validated window instead.
-                set composers to entire contents of slackWindow
-                set matchingComposerCount to 0
-                set matchingComposer to missing value
-                repeat with composerReference in composers
-                    set composerCandidate to contents of composerReference
-                    try
-                        if (role description of composerCandidate) is "text entry area" then
-                            set composerDescription to description of composerCandidate
-                            -- Slack's current desktop client exposes the DM composer as
-                            -- a settable text entry area, but does not consistently expose
-                            -- AXEditable/AXEnabled through System Events.  The stable
-                            -- role/description pair is sufficient; focusability is checked
-                            -- immediately before pasting.
-                            if (composerDescription starts with "Message to ") then
-                                set matchingComposerCount to matchingComposerCount + 1
-                                set matchingComposer to composerCandidate
-                            end if
-                        end if
-                    end try
-                end repeat
-
-                if matchingComposerCount is not 1 then return missing value
+                if (count of sheets of slackWindow) is greater than 0 then return missing value
+                set matchingComposer to my findComposerInAccessibilityTree(slackWindow, 0)
+                if matchingComposer is missing value then return missing value
+                set my composerElement to matchingComposer
                 return matchingComposer
             end tell
         end tell
     end findTargetComposer
 
-    on findTargetHTML(slackWindow)
+    on findComposerInAccessibilityTree(candidateElement, depthLevel)
+        if depthLevel is greater than 40 then return missing value
         tell application "System Events"
-            tell process "Slack"
-                set htmlCandidates to entire contents of slackWindow
-                set htmlCandidateCount to 0
-                set matchingHTML to missing value
-                repeat with htmlReference in htmlCandidates
-                    set htmlCandidate to contents of htmlReference
-                    try
-                        if (role description of htmlCandidate) is "HTML content" then
-                            set htmlCandidateCount to htmlCandidateCount + 1
-                            set matchingHTML to htmlCandidate
-                        end if
-                    end try
-                end repeat
-                -- The Keychain URL has already opened the intended DM. In the
-                -- current Slack client AXURL is not readable through
-                -- System Events, so require the active window to expose exactly
-                -- one HTML view before operating on its composer.
-                if htmlCandidateCount is 1 then return matchingHTML
-                return missing value
-            end tell
-        end tell
-    end findTargetHTML
+            try
+                set roleText to role description of candidateElement
+                if roleText is "text entry area" then
+                    if (description of candidateElement) starts with "Message to " then return candidateElement
+                end if
 
-    on hasBlockingModal(slackWindow)
-        tell application "System Events"
-            tell process "Slack"
-                set dialogCandidates to entire contents of slackWindow
-                repeat with dialogReference in dialogCandidates
-                    set dialogCandidate to contents of dialogReference
-                    try
-                        if (role description of dialogCandidate) is "dialog" then return true
-                    end try
-                end repeat
-                return (count of (every sheet of slackWindow)) is greater than 0
-            end tell
+                if roleText is in {"standard window", "group", "HTML content", "toolbar", "outline", "content list", "log", "tab group", "tab panel", "sidebar", "splitter"} then
+                    repeat with childReference in (UI elements of candidateElement)
+                        set foundElement to my findComposerInAccessibilityTree(contents of childReference, depthLevel + 1)
+                        if foundElement is not missing value then return foundElement
+                    end repeat
+                end if
+            on error
+                return missing value
+            end try
         end tell
-    end hasBlockingModal
+        return missing value
+    end findComposerInAccessibilityTree
 
     on findSendButton(composer)
         tell application "System Events"
             tell process "Slack"
-                set buttonCandidates to entire contents of window 1
-                repeat with buttonReference in buttonCandidates
-                    set buttonCandidate to contents of buttonReference
-                    try
-                        if (role of buttonCandidate) is "AXButton" and (description of buttonCandidate) is "Send now" then return buttonCandidate
-                    end try
-                end repeat
-                return missing value
+                if (count of windows) is 0 then return missing value
+                return my findSendButtonInAccessibilityTree(window 1, 0)
             end tell
         end tell
+    end findSendButton
+
+    on findSendButtonInAccessibilityTree(candidateElement, depthLevel)
+        if depthLevel is greater than 40 then return missing value
+        tell application "System Events"
+            try
+                set roleText to role description of candidateElement
+                if roleText is "button" and (description of candidateElement) is "Send now" then return candidateElement
+
+                if roleText is in {"standard window", "group", "HTML content", "toolbar", "outline", "content list", "log", "tab group", "tab panel", "sidebar", "splitter"} then
+                    repeat with childReference in (UI elements of candidateElement)
+                        set foundElement to my findSendButtonInAccessibilityTree(contents of childReference, depthLevel + 1)
+                        if foundElement is not missing value then return foundElement
+                    end repeat
+                end if
+            on error
+                return missing value
+            end try
+        end tell
+        return missing value
     end findSendButton
 end script
 
