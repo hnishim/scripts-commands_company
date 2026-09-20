@@ -13,20 +13,6 @@
 
 use framework "Foundation"
 
-on launchdEnvironmentValue(environmentKey)
-    set launchTask to current application's NSTask's alloc()'s init()
-    launchTask's setLaunchPath:"/bin/launchctl"
-    launchTask's setArguments:{"getenv", environmentKey}
-    set outputPipe to current application's NSPipe's pipe()
-    launchTask's setStandardOutput:outputPipe
-    launchTask's |launch|()
-    launchTask's waitUntilExit()
-    set outputData to outputPipe's fileHandleForReading()'s readDataToEndOfFile()
-    set outputString to current application's NSString's alloc()'s initWithData:outputData encoding:(current application's NSUTF8StringEncoding)
-    if outputString is missing value then return ""
-    return (outputString's stringByTrimmingCharactersInSet:(current application's NSCharacterSet's whitespaceAndNewlineCharacterSet())) as text
-end launchdEnvironmentValue
-
 on isValidSlackIdentifier(candidateValue)
     if class of candidateValue is not text then return false
     if candidateValue is "" then return false
@@ -355,17 +341,64 @@ script productionAdapter
     end findSendButton
 end script
 
+-- Only this runner touches the macOS Keychain. The password is read through
+-- a pipe; failures discard command output and never expose error details.
+script productionSecurityRunner
+    on runSecurity(commandPath, commandArguments)
+        try
+            set securityTask to current application's NSTask's alloc()'s init()
+            securityTask's setLaunchPath:commandPath
+            securityTask's setArguments:commandArguments
+            set outputPipe to current application's NSPipe's pipe()
+            securityTask's setStandardOutput:outputPipe
+            securityTask's setStandardError:(current application's NSFileHandle's fileHandleWithNullDevice())
+            securityTask's |launch|()
+            set outputData to outputPipe's fileHandleForReading()'s readDataToEndOfFile()
+            securityTask's waitUntilExit()
+            set resultCode to securityTask's terminationStatus() as integer
+            if resultCode is not 0 then return {exitCode:resultCode, stdoutText:""}
+
+            set outputString to current application's NSString's alloc()'s initWithData:outputData encoding:(current application's NSUTF8StringEncoding)
+            if outputString is missing value then return {exitCode:0, stdoutText:""}
+            set outputValue to (outputString's stringByTrimmingCharactersInSet:(current application's NSCharacterSet's newlineCharacterSet())) as text
+            return {exitCode:0, stdoutText:outputValue}
+        on error
+            return {exitCode:-1, stdoutText:""}
+        end try
+    end runSecurity
+end script
+
+script keychainURLProvider
+    -- Tests replace this runner without touching the real Keychain.
+    property commandRunner : missing value
+
+    on readSlackURL()
+        try
+            set securityRunner to my commandRunner
+            if securityRunner is missing value then set securityRunner to productionSecurityRunner
+            set commandResult to securityRunner's runSecurity("/usr/bin/security", {"find-generic-password", "-w", "-s", "my.slack.url-dm-myself", "-a", "my"})
+            if (exitCode of commandResult) is not 0 then return ""
+            set candidateURL to stdoutText of commandResult
+            if class of candidateURL is not text then return ""
+            return candidateURL
+        on error
+            return ""
+        end try
+    end readSlackURL
+end script
+
+on runJobcanWithProvider(adapter, urlProvider)
+    set configuredURL to ""
+    try
+        set configuredURL to urlProvider's readSlackURL()
+    on error
+        return
+    end try
+    if not isValidSlackURL(configuredURL) then return
+    set adapter's configuredSlackURL to configuredURL
+    executeJobcanFlow(adapter)
+end runJobcanWithProvider
+
 on run argv
-    set processEnvironment to current application's NSProcessInfo's processInfo()'s environment()
-    set slackURLValue to processEnvironment's objectForKey:"JOBCAN_SLACK_URL"
-    if slackURLValue is missing value then
-        set slackURL to launchdEnvironmentValue("JOBCAN_SLACK_URL")
-    else
-        set slackURL to slackURLValue as text
-    end if
-
-    if not isValidSlackURL(slackURL) then return
-
-    set productionAdapter's configuredSlackURL to slackURL
-    executeJobcanFlow(productionAdapter)
+    runJobcanWithProvider(productionAdapter, keychainURLProvider)
 end run
