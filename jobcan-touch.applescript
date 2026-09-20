@@ -280,9 +280,14 @@ script productionAdapter
                 if targetHTML is missing value then return missing value
                 if my hasBlockingModal(slackWindow) then return missing value
 
-                set composers to entire contents of targetHTML
+                -- The target HTML element is used to bind this run to the
+                -- Keychain-configured conversation. Slack's current AX tree
+                -- raises -1700 when its descendants are traversed directly,
+                -- so enumerate the already validated window instead.
+                set composers to entire contents of slackWindow
                 set matchingComposers to {}
-                repeat with composerCandidate in composers
+                repeat with composerReference in composers
+                    set composerCandidate to contents of composerReference
                     try
                         if (role description of composerCandidate) is "text entry area" then
                             set composerDescription to description of composerCandidate
@@ -306,14 +311,22 @@ script productionAdapter
         tell application "System Events"
             tell process "Slack"
                 set htmlCandidates to entire contents of slackWindow
-                repeat with htmlCandidate in htmlCandidates
+                set htmlCandidateCount to 0
+                set matchingHTML to missing value
+                repeat with htmlReference in htmlCandidates
+                    set htmlCandidate to contents of htmlReference
                     try
                         if (role description of htmlCandidate) is "HTML content" then
-                            set candidateURL to (value of attribute "AXURL" of htmlCandidate) as text
-                            if candidateURL contains ("/client/" & my workspaceIdentifier & "/" & my conversationIdentifier) then return contents of htmlCandidate
+                            set htmlCandidateCount to htmlCandidateCount + 1
+                            set matchingHTML to htmlCandidate
                         end if
                     end try
                 end repeat
+                -- The Keychain URL has already opened the intended DM. In the
+                -- current Slack client AXURL is not readable through
+                -- System Events, so require the active window to expose exactly
+                -- one HTML view before operating on its composer.
+                if htmlCandidateCount is 1 then return matchingHTML
                 return missing value
             end tell
         end tell
@@ -323,7 +336,8 @@ script productionAdapter
         tell application "System Events"
             tell process "Slack"
                 set dialogCandidates to entire contents of slackWindow
-                repeat with dialogCandidate in dialogCandidates
+                repeat with dialogReference in dialogCandidates
+                    set dialogCandidate to contents of dialogReference
                     try
                         if (role description of dialogCandidate) is "dialog" then return true
                     end try
@@ -336,20 +350,11 @@ script productionAdapter
     on findSendButton(composer)
         tell application "System Events"
             tell process "Slack"
-                set currentParent to composer
-                repeat 5 times
+                set buttonCandidates to entire contents of window 1
+                repeat with buttonReference in buttonCandidates
+                    set buttonCandidate to contents of buttonReference
                     try
-                        set currentParent to parent of currentParent
-                        set buttonCandidates to entire contents of currentParent
-                        set matchingButtons to {}
-                        repeat with buttonCandidate in buttonCandidates
-                            try
-                                if (role of buttonCandidate) is "AXButton" and (description of buttonCandidate) is "Send now" then set end of matchingButtons to contents of buttonCandidate
-                            end try
-                        end repeat
-                        if (count of matchingButtons) is 1 then return item 1 of matchingButtons
-                    on error
-                        exit repeat
+                        if (role of buttonCandidate) is "AXButton" and (description of buttonCandidate) is "Send now" then return buttonCandidate
                     end try
                 end repeat
                 return missing value
