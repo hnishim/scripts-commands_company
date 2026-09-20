@@ -135,11 +135,12 @@ on run argv
         return isValidSlackURL(item 2 of argv)
     end if
 
-    if testMode is not "flow" and testMode is not "entry" then error "unknown test mode"
+    if testMode is not "flow" and testMode is not "entry" and testMode is not "provider" then error "unknown test mode"
     set scenarioName to item 2 of argv
 
     script fakeAdapter
         property configuredSlackURL : ""
+        property expectedURL : ""
         property lockAvailable : true
         property composerReady : true
         property failureStage : ""
@@ -159,6 +160,7 @@ on run argv
         end activateSlack
 
         on openConfiguredConversation()
+            if my configuredSlackURL is not my expectedURL then error "Keychain URL not propagated"
             my recordEvent("open")
         end openConfiguredConversation
 
@@ -199,20 +201,72 @@ on run argv
         end releaseSingleRunGuard
     end script
 
+    -- Test the production provider with a fake command executor. No real Keychain
+    -- or Slack request occurs, and no secret is copied into error output.
+    if testMode is "provider" then
+        script fakeSecurityRunner
+            property calls : 0
+            property resultCode : 0
+            property resultOutput : "slack://channel?team=T123&id=C456"
+            property deny : false
+
+            on runSecurity(commandPath, commandArguments)
+                set my calls to my calls + 1
+                if commandPath is not "/usr/bin/security" then error "incorrect security binary"
+                if commandArguments is not {"find-generic-password", "-w", "-s", "my.slack.url-dm-myself", "-a", "my"} then error "incorrect service or account"
+                if my deny then error "NEVER-EXPOSE synthetic denial"
+                return {exitCode:(my resultCode), stdoutText:(my resultOutput)}
+            end runSecurity
+        end script
+        if scenarioName is "missing" then
+            set fakeSecurityRunner's resultCode to 44
+        else if scenarioName is "access-denied" then
+            set fakeSecurityRunner's deny to true
+        else if scenarioName is "empty" then
+            set fakeSecurityRunner's resultOutput to ""
+        else if scenarioName is "nonzero-with-output" then
+            set fakeSecurityRunner's resultCode to 36
+        else if scenarioName is not "success" then
+            error "unknown provider scenario"
+        end if
+        set originalRunner to keychainURLProvider's commandRunner
+        set keychainURLProvider's commandRunner to fakeSecurityRunner
+        set providerValue to missing value
+        set leakedError to ""
+        try
+            set providerValue to keychainURLProvider's readSlackURL()
+        on error messageText
+            set leakedError to messageText
+        end try
+        set keychainURLProvider's commandRunner to originalRunner
+        if fakeSecurityRunner's calls is not 1 then error "Keychain command must run once"
+        if leakedError is not "" then error "Keychain provider leaked or raised an error"
+        if scenarioName is "success" then
+            if providerValue is not fakeSecurityRunner's resultOutput then error "Keychain output altered"
+        else
+            if providerValue is not "" then error "Keychain failure not rejected"
+        end if
+        return "provider-checked"
+    end if
+
     -- The provider is a test-only replacement for Keychain; no real Slack is invoked.
     if testMode is "entry" then
         script fakeURLProvider
             property suppliedURL : ""
             property denyRead : false
+            property readCount : 0
 
             on readSlackURL()
+                set my readCount to my readCount + 1
                 if my denyRead then error "synthetic Keychain read failure"
                 return my suppliedURL
             end readSlackURL
         end script
 
-        if scenarioName is "success" then
+        if scenarioName is "success-a" then
             set fakeURLProvider's suppliedURL to "slack://channel?team=T123&id=C456"
+        else if scenarioName is "success-b" then
+            set fakeURLProvider's suppliedURL to "slack://channel?team=T987&id=D654"
         else if scenarioName is "missing" or scenarioName is "access-denied" then
             set fakeURLProvider's denyRead to true
         else if scenarioName is "empty" or scenarioName is "legacy-only" then
@@ -223,6 +277,7 @@ on run argv
             error "unknown entry scenario"
         end if
 
+        set fakeAdapter's expectedURL to fakeURLProvider's suppliedURL
         set observedError to false
         try
             runJobcanWithProvider(fakeAdapter, fakeURLProvider)
@@ -230,6 +285,13 @@ on run argv
             set observedError to true
         end try
         if observedError then error "provider failure must not leak to the caller"
+        if fakeURLProvider's readCount is not 1 then error "provider must be read once"
+        if scenarioName is "success-a" or scenarioName is "success-b" then
+            if fakeAdapter's configuredSlackURL is not fakeURLProvider's suppliedURL then error "Keychain URL not delivered"
+        else
+            if fakeAdapter's configuredSlackURL is not "" then error "invalid URL reached adapter"
+            if (count of fakeAdapter's eventLog) is not 0 then error "invalid URL caused side effects"
+        end if
         return joinEvents(fakeAdapter's eventLog)
     end if
 
@@ -295,12 +357,24 @@ assert_entry_events() {
     actual="$(osascript "$testable_script" entry "$scenario")"
     [ "$actual" = "$expected" ] || fail "entry scenario $scenario events '$actual', expected '$expected'"
 }
-assert_entry_events success 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
+assert_entry_events success-a 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
+assert_entry_events success-b 'lock,activate,open,wait,backup,set-command,paste,send,restore,release'
 assert_entry_events missing ''
 assert_entry_events access-denied ''
 assert_entry_events empty ''
 assert_entry_events malformed ''
 JOBCAN_SLACK_URL='slack://channel?team=T123&id=C456' assert_entry_events legacy-only ''
+
+# Production-provider command-boundary regressions (real Keychain is mocked).
+assert_provider_scenario() {
+    local scenario="$1"
+    local actual
+    actual="$(osascript "$testable_script" provider "$scenario")"
+    [ "$actual" = "provider-checked" ] || fail "provider scenario $scenario failed"
+}
+for scenario in success missing access-denied empty nonzero-with-output; do
+    assert_provider_scenario "$scenario"
+done
 
 # HIR-251 permanent safety regressions.
 run_flow_scenario() {
