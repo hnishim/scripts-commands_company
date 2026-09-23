@@ -12,6 +12,7 @@
 # @raycast.description Jobcanで打刻
 
 use framework "Foundation"
+use scripting additions
 
 on keychainSlackURL()
     set keychainTask to current application's NSTask's alloc()'s init()
