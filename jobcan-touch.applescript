@@ -85,26 +85,20 @@ on isValidSlackURL(candidateURL)
 end isValidSlackURL
 
 on run argv
-    -- Keychain is the only destination source; lookup failure has no UI effects.
     set slackURL to keychainSlackURL()
-
     if not isValidSlackURL(slackURL) then return
 
     tell application "Slack"
         activate
         delay 0.5
-    end tell
-
-    set slackURLObject to current application's NSURL's URLWithString:slackURL
-    if slackURLObject is missing value then return
-    set workspaceObject to current application's NSWorkspace's sharedWorkspace()
-    if not (workspaceObject's openURL:slackURLObject) then return
-    delay 1
-
-    tell application "System Events"
-        set the clipboard to "/jobcan_touch"
-        keystroke "v" using {command down}
+        open location (my slackURL)
         delay 0.5
-        key code 36
+        tell application "System Events"
+            set the clipboard to "/jobcan_touch"
+            keystroke "v" using {command down}
+            delay 0.5
+            key code 36
+            key code 36 using {command down}
+        end tell
     end tell
 end run
