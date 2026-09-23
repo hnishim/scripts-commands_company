@@ -25,6 +25,28 @@ on isValidSlackIdentifier(candidateValue)
     return true
 end isValidSlackIdentifier
 
+on keychainSlackURL()
+    set keychainTask to current application's NSTask's alloc()'s init()
+    keychainTask's setLaunchPath:"/usr/bin/security"
+    keychainTask's setArguments:{"find-generic-password", "-s", "my.slack.url-dm-myself", "-a", "my", "-w"}
+    set outputPipe to current application's NSPipe's pipe()
+    keychainTask's setStandardOutput:outputPipe
+
+    try
+        keychainTask's |launch|()
+        keychainTask's waitUntilExit()
+    on error
+        return ""
+    end try
+
+    if keychainTask's terminationStatus() is not 0 then return ""
+
+    set outputData to outputPipe's fileHandleForReading()'s readDataToEndOfFile()
+    set outputString to current application's NSString's alloc()'s initWithData:outputData encoding:(current application's NSUTF8StringEncoding)
+    if outputString is missing value then return ""
+    return (outputString's stringByTrimmingCharactersInSet:(current application's NSCharacterSet's whitespaceAndNewlineCharacterSet())) as text
+end keychainSlackURL
+
 on isValidSlackURL(candidateURL)
     if class of candidateURL is not text then return false
 
@@ -64,11 +86,7 @@ end isValidSlackURL
 
 on run argv
     -- Keychain is the only destination source; lookup failure has no UI effects.
-    try
-        set slackURL to do shell script "/usr/bin/security find-generic-password -s my.slack.url-dm-myself -a my -w"
-    on error
-        return
-    end try
+    set slackURL to keychainSlackURL()
 
     if not isValidSlackURL(slackURL) then return
 
