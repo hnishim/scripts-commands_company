@@ -49,5 +49,6 @@ tell application "Slack"
         keystroke "v" using {command down}
         delay 0.5
         key code 36
+        key code 36 using {command down}
     end tell
 end tell
