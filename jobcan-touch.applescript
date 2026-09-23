@@ -91,7 +91,7 @@ on run argv
     tell application "Slack"
         activate
         delay 0.5
-        open location (my slackURL)
+        open location (slackURL)
         delay 0.5
         tell application "System Events"
             set the clipboard to "/jobcan_touch"
