@@ -91,14 +91,14 @@ on run argv
     tell application "Slack"
         activate
         delay 0.5
-        open location (slackURL)
+    end tell
+    open location (slackURL)
+    delay 0.5
+    tell application "System Events"
+        set the clipboard to "/jobcan_touch"
+        keystroke "v" using {command down}
         delay 0.5
-        tell application "System Events"
-            set the clipboard to "/jobcan_touch"
-            keystroke "v" using {command down}
-            delay 0.5
-            key code 36
-            key code 36 using {command down}
-        end tell
+        key code 36
+        key code 36 using {command down}
     end tell
 end run
