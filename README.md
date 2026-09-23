@@ -4,7 +4,7 @@
 
 | Script Command | 機能 | 認証 |
 | --- | --- | --- |
-| `jobcan-touch.applescript` | Slack Desktopの対象conversationへJobcanのslash commandを送信 | `JOBCAN_SLACK_URL` |
+| `jobcan-touch.applescript` | Slackの自分宛DMへJobcanコマンドを送信 | Keychain |
 | `google-drive_active-document-link-copier_gdrivefs.sh` | 最前面で開いているGoogle DriveファイルのURLをクリップボードへコピー | 不要 |
 | `google-drive-path-generator.sh` | クリップボード上のGoogle Drive URLに対応するローカル項目を開く | Google Drive API OAuth |
 
@@ -16,22 +16,19 @@
 
 ## Jobcan touch
 
-`jobcan-touch.applescript` はSlack Desktopを開き、対象conversationへ `/jobcan_touch` を送信するRaycast Script Commandです。Slackのworkspace／conversation固有値は公開repositoryへ保存せず、Raycastの実行環境で `JOBCAN_SLACK_URL` として設定してください。
+`jobcan-touch.applescript` は、RaycastからSlack Desktopの自分宛DMに `/jobcan_touch` を1回送るScript Commandです。Slackの送信先URLはKeychainだけから取得し、公開リポジトリには保存しません。
 
-設定値は次の形式に限定されます。`YOUR_WORKSPACE_ID` と `YOUR_CONVERSATION_ID` は、実際の値をローカルの実行環境だけに設定します。
+### 設定
 
-```sh
-launchctl setenv JOBCAN_SLACK_URL 'slack://channel?team=YOUR_WORKSPACE_ID&id=YOUR_CONVERSATION_ID'
-```
+1. キーチェーンアクセスで、ログインキーチェーンに一般パスワード項目を作成します。サービス名（項目名）は `my.slack.url-dm-myself`、アカウント名は `my`、パスワードには自分宛DMの `slack://channel?team=...&id=...` 形式のURLを設定します。実際のURLをシェル履歴・ソース・ログに残さないでください
+2. RaycastのScript Commandsとして `jobcan-touch.applescript` を登録します。既存の登録を切り替える際は、Raycastが実行するファイルと候補の内容が同一であることを確認します
+3. 初回の実機確認では、Slackの対象DMと空の入力欄、送信内容、送信回数を確認してから実行します。送信結果が不明な場合は自動再送しません
 
-1. RaycastのScript Commandsとして `jobcan-touch.applescript` を登録します
-2. Terminalで上記の `launchctl setenv` を実行し、Raycastが利用するユーザー環境へ `JOBCAN_SLACK_URL` を設定します。設定ファイルや値そのものはGitへ追加しません
-3. Raycastを終了して再起動します。起動済みのRaycastプロセスには、後から設定した環境変数は反映されません
-4. Raycastから実行し、Slack Desktopの対象conversationで `/jobcan_touch` が送信されることを確認します
+Keychainの読取りに失敗した場合、または値が空の場合は、Slackを開かず、クリップボードを変更せず、送信もしません。旧環境変数からの自動取得には対応しません。
 
-`launchctl setenv` は現在のユーザーセッションのlaunchd環境へ設定します。設定を解除する場合は、Terminalで `launchctl unsetenv JOBCAN_SLACK_URL` を実行してからRaycastを再起動してください。
+### 既知の制約
 
-`JOBCAN_SLACK_URL` が未設定または形式不正の場合は、Slackをactivateせず、clipboardを変更せず送信せずに終了します。Raycastの実登録artifactとの対応、および実Slack／Jobcan経路は、候補ごとにmacOS上で確認してください。
+以前動作した単純な操作手順を基準にしており、Slackの入力欄・会話の追加アクセシビリティ探索、既存下書きの自動確認、二重起動の防止、クリップボードの復元は実装していません。実行前に対象DMと入力欄の状態を確認してください。クリップボードは `/jobcan_touch` に置き換わります。対象会話が違う、下書きが残っている等の異常を認識した場合は、実行しないでください。実送信の成功はmacOS・Raycast・Slackでの確認が必要です。
 
 ## Copy Active Document Google Drive Link
 
