@@ -43,7 +43,7 @@ KEYCHAIN_HELPER_CALLS = {
 }
 HELPER_CALLS = {
     "isValidSlackIdentifier": set(),
-    "isValidSlackURL": {"isValidSlackIdentifier"},
+    "isValidSlackURL": {"isValidSlackIdentifier", "text"},
     "tryAcquireJobcanLock": {"alloc", "initWithPath", "tryLock"},
     "releaseJobcanLock": {"unlock"},
     "jobcanLockPath": {"NSHomeDirectory"},
@@ -147,13 +147,21 @@ class JobcanTouchSafetyTests(unittest.TestCase):
 
     def unapproved_statement_tokens(self, source: str) -> list[str]:
         allowed_statement = re.compile(r"(?i)^(?:on|end|set|return|if|else|try|error|my)\b")
+        allowed_bounded_repeat = re.compile(
+            r"(?i)^repeat\s+with\s+[A-Za-z][A-Za-z0-9_]*\s+in\s+"
+            r"characters\s+of\s+[A-Za-z][A-Za-z0-9_]*$"
+        )
         allowed_receiver = re.compile(r"(?i)^(?:current\s+application's|[A-Za-z][A-Za-z0-9_]*'s)\b")
         unexpected = []
         for line in self.executable_source(source).splitlines():
             statement = line.strip()
             if not statement:
                 continue
-            if allowed_statement.match(statement) or allowed_receiver.match(statement):
+            if (
+                allowed_statement.match(statement)
+                or allowed_receiver.match(statement)
+                or allowed_bounded_repeat.fullmatch(statement)
+            ):
                 continue
             unexpected.append(statement.split(maxsplit=1)[0])
         return unexpected
@@ -480,6 +488,9 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
             "    current application's NSFileManager's |unapprovedSelector|()\n"
             "end runSafeJobcanTouch",
+            "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
+            "    repeat\n        set candidateURL to candidateURL\n"
+            "    end repeat\nend runSafeJobcanTouch",
             'on runSafeJobcanTouch(candidateURL, lockPath, effects)\n'
             '    display dialog "synthetic"\nend runSafeJobcanTouch',
         )
@@ -576,8 +587,7 @@ return "PASS"
 set lockObject to my tryAcquireJobcanLock(item 1 of argv)
 if lockObject is missing value then error "child acquisition failed" number 1
 set signalText to current application's NSString's stringWithString:"ready"
-set signalData to signalText's dataUsingEncoding:(current application's NSUTF8StringEncoding)
-current application's NSFileManager's defaultManager()'s createFileAtPath:(item 2 of argv) contents:signalData attributes:(missing value)
+if (signalText's writeToFile:(item 2 of argv) atomically:true) is false then error "child readiness marker write failed" number 1
 delay 30
 return "finished"
 '''
@@ -619,13 +629,13 @@ return "ACQUIRED"
                 self.assertTrue(ready_path.exists(), "子プロセスがロック取得を通知しませんでした")
                 self.assertEqual(try_acquire(), "BLOCKED", "実行中の排他が機能しません")
                 child.kill()
-                child.wait(timeout=8)
+                child.communicate(timeout=8)
                 self.assertEqual(
                     try_acquire(),
                     "BLOCKED",
                     "異常終了したロックを自動で解除しました。手動復旧が必要です",
                 )
-                lock_path.unlink(missing_ok=True)
+                lock_path.rmdir()
                 self.assertEqual(
                     try_acquire(),
                     "ACQUIRED",
@@ -634,7 +644,7 @@ return "ACQUIRED"
             finally:
                 if child.poll() is None:
                     child.kill()
-                    child.wait(timeout=8)
+                    child.communicate(timeout=8)
 
 
 if __name__ == "__main__":
