@@ -23,6 +23,19 @@ EXTERNAL_EFFECT = re.compile(
 )
 APPLE_SCRIPT_LITERALS = re.compile(r'"(?:[^"\\]|\\.)*"')
 APPLE_SCRIPT_COMMENTS = re.compile(r"(?m)--.*$")
+KEYCHAIN_READ_ONLY_FORBIDDEN = re.compile(
+    r"(?i)\btell\s+application\b|\bopen\s+(?:location|application|file)\b|\bopenURL\b|"
+    r"\bset\s+the\s+clipboard\b|\bkeystroke\b|\bkey\s+code\b|"
+    r"\bdo\s+shell\s+script\b|\bNSWorkspace\b|\bNSPasteboard\b|"
+    r"\bactivate\b|\b(?:run|load|store)\s+script\b|\bNSAppleScript\b|"
+    r"\bNSAppleEvent(?:Descriptor|Manager)\b|\bperformSelector\b"
+)
+KEYCHAIN_HELPER_CALLS = {
+    "alloc", "init", "pipe", "setLaunchPath", "setArguments", "setStandardOutput",
+    "launch", "waitUntilExit", "terminationStatus", "fileHandleForReading",
+    "readDataToEndOfFile", "initWithData", "encoding",
+    "stringByTrimmingCharactersInSet", "whitespaceAndNewlineCharacterSet",
+}
 HELPER_CALLS = {
     "isValidSlackIdentifier": set(),
     "isValidSlackURL": {"isValidSlackIdentifier"},
@@ -67,23 +80,43 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
         calls.update(re.findall(r"\bmy\s+([A-Za-z][A-Za-z0-9_]*)\b", body))
         calls.update(re.findall(r"\b([A-Za-z][A-Za-z0-9_]*)\s*:", body))
+        calls.update(re.findall(r"\|([A-Za-z][A-Za-z0-9_]*)\|\s*\(", body))
+        calls.difference_update({"return", "error", "if", "on", "end", "set"})
         unexpected = calls - HELPER_CALLS[name]
         if unexpected:
             issues.append("未許可呼出し: " + ",".join(sorted(unexpected)))
         return issues
 
-    def extract_handler(self, name: str, signature: str) -> str:
+    def raw_handler(self, name: str, signature: str) -> str:
         pattern = re.compile(
             rf"(?ms)^on {re.escape(signature)}\s*$.*?^end {re.escape(name)}\s*$"
         )
         match = pattern.search(self.source)
         self.assertIsNotNone(match, f"必要なAppleScriptハンドラーがありません: {name}")
-        handler = match.group(0)
+        return match.group(0)
+
+    def extract_handler(self, name: str, signature: str) -> str:
+        handler = self.raw_handler(name, signature)
         self.assertFalse(
             self.handler_issues(name, handler),
             f"副作用・動的実行・未許可呼出しのある本番ハンドラーは検査実行しません: {name}",
         )
         return handler
+
+    def keychain_helper_issues(self, handler: str) -> list[str]:
+        executable = APPLE_SCRIPT_COMMENTS.sub("", APPLE_SCRIPT_LITERALS.sub("", handler))
+        issues = []
+        if KEYCHAIN_READ_ONLY_FORBIDDEN.search(executable):
+            issues.append("Keychain前処理にUI・送信・clipboard・動的実行があります")
+        body = executable.split("\n", 1)[1]
+        calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
+        calls.update(re.findall(r"\bmy\s+([A-Za-z][A-Za-z0-9_]*)\b", body))
+        calls.update(re.findall(r"\b([A-Za-z][A-Za-z0-9_]*)\s*:", body))
+        calls.update(re.findall(r"\|([A-Za-z][A-Za-z0-9_]*)\|\s*\(", body))
+        calls.difference_update({"return", "error", "if", "on", "end", "set"})
+        if calls - KEYCHAIN_HELPER_CALLS:
+            issues.append("Keychain前処理に未許可呼出しがあります")
+        return issues
 
     def extract_run_entry(self) -> str:
         match = re.search(r"(?ms)^on run argv\s*$.*?^end run\s*$", self.source)
@@ -239,6 +272,36 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             "ReturnとCommand-Returnの間に別のキー操作があります",
         )
 
+    def test_keychain_preflight_is_confined_to_read_only_lookup(self) -> None:
+        handler = self.raw_handler("keychainSlackURL", "keychainSlackURL()")
+        self.assertFalse(
+            self.keychain_helper_issues(handler),
+            "送信前のKeychain取得処理は読取専用の許可済み呼出しだけにしてください",
+        )
+        launch_paths = re.findall(r'(?im)\bsetLaunchPath:\s*"([^"]+)"', handler)
+        self.assertEqual(len(launch_paths), 1)
+        self.assertEqual(Path(launch_paths[0]).as_posix(), "/usr/bin/security")
+        arguments_match = re.search(r"(?is)setArguments:\s*\{([^}]*)\}", handler)
+        self.assertIsNotNone(arguments_match, "Keychain読取引数が見つかりません")
+        arguments = re.findall(r'"([^"]*)"', arguments_match.group(1))
+        self.assertEqual(len(arguments), 6)
+        self.assertTrue(
+            arguments[0] == "find-generic-password"
+            and arguments[1] == "-s"
+            and arguments[3] == "-a"
+            and arguments[5] == "-w",
+            "Keychainコマンドは汎用パスワードの読取専用引数を所定順に使ってください",
+        )
+        self.assertTrue(arguments[2] and arguments[4])
+
+    def test_safety_scanner_rejects_unsafe_keychain_handler(self) -> None:
+        unsafe = (
+            "on keychainSlackURL()\n"
+            "    tell application \"Slack\" to activate\n"
+            "    return \"\"\nend keychainSlackURL"
+        )
+        self.assertTrue(self.keychain_helper_issues(unsafe))
+
     def test_synthetic_slack_url_inputs(self) -> None:
         cases = (
             ("slack://channel?team=T123&id=D456", True),
@@ -279,6 +342,9 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             "executeAndReturnError:errorValue\nend runSafeJobcanTouch",
             "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
             "    my unapprovedPreparation\nend runSafeJobcanTouch",
+            "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
+            "    current application's NSFileManager's |unapprovedSelector|()\n"
+            "end runSafeJobcanTouch",
         )
         for handler in unsafe_handlers:
             with self.subTest(handler=handler.splitlines()[1].strip()):
