@@ -138,7 +138,7 @@ on snapshotJobcanPasteboard(pasteboard)
     return snapshot
 end snapshotJobcanPasteboard
 
-on restoreJobcanPasteboard(pasteboard, snapshot)
+on restoreJobcanPasteboard(pasteboard, expectedChangeCount, snapshot)
     set restoredItems to current application's NSMutableArray's array()
     repeat with snapshotReference in snapshot
         set itemSnapshot to contents of snapshotReference
@@ -149,16 +149,24 @@ on restoreJobcanPasteboard(pasteboard, snapshot)
         repeat with itemIndex from 1 to (count of itemTypes)
             set pasteboardType to item itemIndex of itemTypes
             set representationData to item itemIndex of itemData
-            if (restoredItem's setData:representationData forType:pasteboardType) is false then return false
+            if (restoredItem's setData:representationData forType:pasteboardType) is false then return "clipboard_restore_failed"
         end repeat
         restoredItems's addObject:restoredItem
     end repeat
 
+    if (pasteboard's changeCount()) is not expectedChangeCount then return "clipboard_restore_conflict"
     if (count of restoredItems) is 0 then
-        pasteboard's clearContents()
-        return true
+        set clearChangeCount to pasteboard's clearContents()
+        if clearChangeCount is not (expectedChangeCount + 1) then return "clipboard_restore_conflict"
+        if (pasteboard's changeCount()) is not clearChangeCount then return "clipboard_restore_conflict"
+        return "restored"
     end if
-    return pasteboard's writeObjects:restoredItems
+    set clearChangeCount to pasteboard's clearContents()
+    if clearChangeCount is not (expectedChangeCount + 1) then return "clipboard_restore_conflict"
+    if (pasteboard's changeCount()) is not clearChangeCount then return "clipboard_restore_conflict"
+    if (pasteboard's writeObjects:restoredItems) is false then return "clipboard_restore_failed"
+    if (pasteboard's changeCount()) is not clearChangeCount then return "clipboard_restore_conflict"
+    return "restored"
 end restoreJobcanPasteboard
 
 on jobcanPasteboardSnapshotsMatch(expectedSnapshot, actualSnapshot)
@@ -170,8 +178,13 @@ on jobcanPasteboardSnapshotsMatch(expectedSnapshot, actualSnapshot)
         set actualTypes to item 1 of actualItem
         set expectedData to item 2 of expectedItem
         set actualData to item 2 of actualItem
-        if expectedTypes is not equal to actualTypes then return false
+        if (count of expectedTypes) is not (count of actualTypes) then return false
         if (count of expectedData) is not (count of actualData) then return false
+        repeat with typeIndex from 1 to (count of expectedTypes)
+            set expectedTypeText to (item typeIndex of expectedTypes) as text
+            set actualTypeText to (item typeIndex of actualTypes) as text
+            if expectedTypeText is not equal to actualTypeText then return false
+        end repeat
         repeat with typeIndex from 1 to (count of expectedData)
             set expectedRepresentation to item typeIndex of expectedData
             set actualRepresentation to item typeIndex of actualData
@@ -180,6 +193,20 @@ on jobcanPasteboardSnapshotsMatch(expectedSnapshot, actualSnapshot)
     end repeat
     return true
 end jobcanPasteboardSnapshotsMatch
+
+on restoreJobcanPasteboardIfUnchanged(pasteboard, expectedChangeCount, snapshot)
+    if (pasteboard's changeCount()) is not expectedChangeCount then return "clipboard_restore_conflict"
+    try
+        set restoreResult to my restoreJobcanPasteboard(pasteboard, expectedChangeCount, snapshot)
+        if restoreResult is not "restored" then return restoreResult
+        set restoredSnapshot to my snapshotJobcanPasteboard(pasteboard)
+        if restoredSnapshot is missing value then return "clipboard_restore_failed"
+        if not my jobcanPasteboardSnapshotsMatch(snapshot, restoredSnapshot) then return "clipboard_restore_failed"
+    on error
+        return "clipboard_restore_failed"
+    end try
+    return "restored"
+end restoreJobcanPasteboardIfUnchanged
 
 on performJobcanTouch(candidateURL)
     set pasteboard to current application's NSPasteboard's generalPasteboard()
@@ -194,10 +221,19 @@ on performJobcanTouch(candidateURL)
     if (commandItem's setString:"/jobcan_touch" forType:(current application's NSPasteboardTypeString)) is false then return "blocked_clipboard_write"
     set commandItems to current application's NSMutableArray's array()
     commandItems's addObject:commandItem
+    if (pasteboard's changeCount()) is not countAfterSnapshot then return "blocked_clipboard_conflict"
+    set clearChangeCount to pasteboard's clearContents()
+    if (pasteboard's changeCount()) is not clearChangeCount then return "blocked_clipboard_conflict"
+    if clearChangeCount is not (countAfterSnapshot + 1) then return "blocked_clipboard_conflict"
     set writeSucceeded to pasteboard's writeObjects:commandItems
     set countAfterCommand to pasteboard's changeCount()
-    if writeSucceeded is false then return "blocked_clipboard_write"
-    if countAfterCommand is not (countAfterSnapshot + 1) then return "blocked_clipboard_conflict"
+    if writeSucceeded is false then
+        if countAfterCommand is not clearChangeCount then return "blocked_clipboard_conflict"
+        set restorationResult to my restoreJobcanPasteboardIfUnchanged(pasteboard, clearChangeCount, originalSnapshot)
+        if restorationResult is not "restored" then return restorationResult
+        return "blocked_clipboard_write"
+    end if
+    if countAfterCommand is not clearChangeCount then return "blocked_clipboard_conflict"
 
     set operationResult to "performed"
     try
@@ -206,26 +242,35 @@ on performJobcanTouch(candidateURL)
             delay 0.5
             open location (candidateURL)
             delay 0.5
-            tell application "System Events"
-                keystroke "v" using {command down}
-                delay 0.5
-                key code 36
-                key code 36 using {command down}
-            end tell
+            if (pasteboard's changeCount()) is not countAfterCommand then
+                set operationResult to "clipboard_restore_conflict"
+            else
+                tell application "System Events"
+                    keystroke "v" using {command down}
+                    if (pasteboard's changeCount()) is not countAfterCommand then
+                        set operationResult to "clipboard_restore_conflict"
+                    else
+                        delay 0.5
+                        if (pasteboard's changeCount()) is not countAfterCommand then
+                            set operationResult to "clipboard_restore_conflict"
+                        else
+                            key code 36
+                            if (pasteboard's changeCount()) is not countAfterCommand then
+                                set operationResult to "clipboard_restore_conflict"
+                            else
+                                key code 36 using {command down}
+                            end if
+                        end if
+                    end if
+                end tell
+            end if
         end tell
     on error
         set operationResult to "operation_failed"
     end try
 
-    if (pasteboard's changeCount()) is not countAfterCommand then return "clipboard_restore_conflict"
-    try
-        if (my restoreJobcanPasteboard(pasteboard, originalSnapshot)) is false then return "clipboard_restore_failed"
-        set restoredSnapshot to my snapshotJobcanPasteboard(pasteboard)
-        if restoredSnapshot is missing value then return "clipboard_restore_failed"
-        if not my jobcanPasteboardSnapshotsMatch(originalSnapshot, restoredSnapshot) then return "clipboard_restore_failed"
-    on error
-        return "clipboard_restore_failed"
-    end try
+    set restorationResult to my restoreJobcanPasteboardIfUnchanged(pasteboard, countAfterCommand, originalSnapshot)
+    if restorationResult is not "restored" then return restorationResult
     return operationResult
 end performJobcanTouch
 
