@@ -12,6 +12,35 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "jobcan-touch.applescript"
 OSASCRIPT = Path("/usr/bin/osascript")
+EXTERNAL_EFFECT = re.compile(
+    r"(?i)\btell\s+application\b|\bopen\s+location\b|\bopenURL\b|"
+    r"\bset\s+the\s+clipboard\b|\bkeystroke\b|\bkey\s+code\b|"
+    r"\bdo\s+shell\s+script\b|\bNSTask\b|\bNSWorkspace\b|"
+    r"\bNSPasteboard\b|\bactivate\b"
+)
+HELPER_CALLS = {
+    "isValidSlackIdentifier": set(),
+    "isValidSlackURL": {"isValidSlackIdentifier"},
+    "tryAcquireJobcanLock": {"alloc", "tryLock"},
+    "releaseJobcanLock": {"unlock"},
+    "runSafeJobcanTouch": {
+        "isValidSlackURL",
+        "tryAcquireJobcanLock",
+        "releaseJobcanLock",
+        "performJobcanTouch",
+    },
+}
+TEST_EFFECTS = '''
+script TestEffects
+    property callCount : 0
+    property shouldRaise : false
+    on performJobcanTouch(lockObject)
+        set my callCount to my callCount + 1
+        if my shouldRaise then error "synthetic failure" number 42
+        return "performed"
+    end performJobcanTouch
+end script
+'''
 
 
 class JobcanTouchSafetyTests(unittest.TestCase):
@@ -27,12 +56,34 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         )
         match = pattern.search(self.source)
         self.assertIsNotNone(match, f"必要なAppleScriptハンドラーがありません: {name}")
+        handler = match.group(0)
+        self.assertIsNone(
+            EXTERNAL_EFFECT.search(handler),
+            f"副作用を含む本番ハンドラーは検査実行しません: {name}",
+        )
+        body = handler.split("\n", 1)[1]
+        body = re.sub(r'"(?:[^"\\]|\\.)*"', "", body)
+        calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
+        self.assertFalse(
+            calls - HELPER_CALLS[name],
+            f"許可していない本番ハンドラー呼出しは検査実行しません: {name}",
+        )
+        return handler
+
+    def extract_run_entry(self) -> str:
+        match = re.search(r"(?ms)^on run argv\s*$.*?^end run\s*$", self.source)
+        self.assertIsNotNone(match, "本番のrun入口が見つかりません")
         return match.group(0)
 
     def run_osascript(self, handlers: str, run_body: str, *arguments: str) -> str:
+        self.assertIsNone(
+            EXTERNAL_EFFECT.search(handlers),
+            "副作用を含む本番コードはosascriptで実行しません",
+        )
         program = (
             'use framework "Foundation"\n'
             + handlers
+            + TEST_EFFECTS
             + "\non run argv\n"
             + run_body
             + "\nend run\n"
@@ -65,13 +116,51 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         )
 
     def lock_handlers(self) -> str:
+        acquire = self.extract_handler(
+            "tryAcquireJobcanLock", "tryAcquireJobcanLock(lockPath)"
+        )
+        self.assertRegex(
+            acquire,
+            r"(?i)initWithPath:\s*\(?\s*\(?lockPath\b",
+            "テスト用の一時パスを使わないロック取得処理は実行しません",
+        )
         return "\n\n".join(
             (
-                self.extract_handler(
-                    "tryAcquireJobcanLock", "tryAcquireJobcanLock(lockPath)"
-                ),
+                self.extract_handler("tryAcquireJobcanLock", "tryAcquireJobcanLock(lockPath)"),
                 self.extract_handler("releaseJobcanLock", "releaseJobcanLock(lockObject)"),
             )
+        )
+
+    def safe_workflow_handlers(self) -> str:
+        return "\n\n".join(
+            (
+                self.url_handlers(),
+                self.lock_handlers(),
+                self.extract_handler(
+                    "runSafeJobcanTouch",
+                    "runSafeJobcanTouch(candidateURL, lockPath, effects)",
+                ),
+            )
+        )
+
+    def test_existing_raycast_keychain_and_send_order_are_preserved(self) -> None:
+        self.assertIn("# @raycast.schemaVersion 1", self.source)
+        self.assertIn("# @raycast.title Jobcan touch", self.source)
+        self.assertIn("# @raycast.mode silent", self.source)
+        self.assertRegex(self.source, r"(?i)on keychainSlackURL\(\)")
+        self.assertIn("find-generic-password", self.source)
+        key_events = list(
+            re.finditer(
+                r"(?m)^\s*key code 36(?:\s+using \{command down\})?\s*$",
+                self.source,
+            )
+        )
+        self.assertEqual(len(key_events), 2, "確認済みの送信キー列が変わっています")
+        self.assertLess(key_events[0].start(), key_events[1].start())
+        self.assertRegex(
+            self.source[key_events[0].end() : key_events[1].start()],
+            r"(?m)^\s*$",
+            "ReturnとCommand-Returnの間に別のキー操作があります",
         )
 
     def test_synthetic_slack_url_inputs(self) -> None:
@@ -97,25 +186,55 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         body = "\n".join(statements) + '\nreturn "PASS"'
         self.assertEqual(self.run_osascript(self.url_handlers(), body), "PASS")
 
-    def test_invalid_url_guard_precedes_slack_and_clipboard_actions(self) -> None:
-        guard = re.search(
-            r"(?i)if\s+not\s+isValidSlackURL\(slackURL\)\s+then\s+return",
-            self.source,
+    def test_run_entry_delegates_before_any_external_effect(self) -> None:
+        entry = self.extract_run_entry()
+        self.assertRegex(
+            entry,
+            r"(?i)\b(?:my\s+)?runSafeJobcanTouch\s*\(",
+            "本番入口が送信なしで検査できる安全ワークフローを使いません",
         )
-        self.assertIsNotNone(guard, "送信先URLの検証後に停止する境界がありません")
-        side_effects = list(
-            re.finditer(
-                r'(?i)tell\s+application\s+"Slack"|open\s+location|openURL\s*:|'
-                r"set\s+the\s+clipboard|keystroke|key\s+code",
-                self.source,
-            )
+        self.assertIsNone(
+            EXTERNAL_EFFECT.search(entry),
+            "本番run入口に直接のSlack・入力・クリップボード操作があります",
         )
-        self.assertTrue(side_effects, "Slack操作・クリップボード操作が見つかりません")
-        self.assertLess(
-            guard.start(),
-            min(effect.start() for effect in side_effects),
-            "不正URLを拒否する前にSlackまたはクリップボードを操作します",
-        )
+
+    def test_entry_rejects_invalid_url_and_lock_conflict_before_effects(self) -> None:
+        handlers = self.safe_workflow_handlers()
+        with tempfile.TemporaryDirectory(prefix="hir318-entry-") as directory:
+            lock_path = str(Path(directory) / "send.lock")
+            body = '''
+set TestEffects's callCount to 0
+set invalidResult to my runSafeJobcanTouch("slack://channel?team=&id=D456", item 1 of argv, TestEffects)
+if invalidResult is not "blocked_invalid_url" then error "invalid URL was not stopped" number 1
+if TestEffects's callCount is not 0 then error "invalid URL reached external effects" number 1
+set fileManager to current application's NSFileManager's defaultManager()
+if fileManager's fileExistsAtPath:(item 1 of argv) then error "invalid URL touched the lock path" number 1
+set heldLock to my tryAcquireJobcanLock(item 1 of argv)
+if heldLock is missing value then error "fixture lock acquisition failed" number 1
+set duplicateResult to my runSafeJobcanTouch("slack://channel?team=T123&id=D456", item 1 of argv, TestEffects)
+if duplicateResult is not "blocked_duplicate" then error "competing run was not stopped" number 1
+if TestEffects's callCount is not 0 then error "competing run reached external effects" number 1
+my releaseJobcanLock(heldLock)
+return "PASS"
+'''
+            self.assertEqual(self.run_osascript(handlers, body, lock_path), "PASS")
+
+    def test_caught_operation_error_releases_lock(self) -> None:
+        handlers = self.safe_workflow_handlers()
+        with tempfile.TemporaryDirectory(prefix="hir318-error-lock-") as directory:
+            lock_path = str(Path(directory) / "send.lock")
+            body = '''
+set TestEffects's callCount to 0
+set TestEffects's shouldRaise to true
+set resultValue to my runSafeJobcanTouch("slack://channel?team=T123&id=D456", item 1 of argv, TestEffects)
+if resultValue is not "operation_failed" then error "synthetic failure was not handled" number 1
+if TestEffects's callCount is not 1 then error "synthetic operation was not called once" number 1
+set reacquiredLock to my tryAcquireJobcanLock(item 1 of argv)
+if reacquiredLock is missing value then error "caught error left the lock held" number 1
+my releaseJobcanLock(reacquiredLock)
+return "PASS"
+'''
+            self.assertEqual(self.run_osascript(handlers, body, lock_path), "PASS")
 
     def test_lock_is_exclusive_and_releases_after_normal_exit(self) -> None:
         handlers = self.lock_handlers()
@@ -137,7 +256,7 @@ return "PASS"
 '''
             self.assertEqual(self.run_osascript(handlers, body, lock_path), "PASS")
 
-    def test_abnormal_exit_does_not_auto_break_stale_lock(self) -> None:
+    def test_abnormal_exit_requires_explicit_manual_recovery(self) -> None:
         handlers = self.lock_handlers()
         with tempfile.TemporaryDirectory(prefix="hir318-crash-lock-") as directory:
             lock_path = Path(directory) / "send.lock"
@@ -188,16 +307,22 @@ return "ACQUIRED"
                     )
                 self.assertTrue(ready_path.exists(), "子プロセスがロック取得を通知しませんでした")
                 self.assertEqual(try_acquire(), "BLOCKED", "実行中の排他が機能しません")
-                child.terminate()
+                child.kill()
                 child.wait(timeout=8)
                 self.assertEqual(
                     try_acquire(),
                     "BLOCKED",
-                    "異常終了したロックを自動で解除しました。復旧は明示操作が必要です",
+                    "異常終了したロックを自動で解除しました。手動復旧が必要です",
+                )
+                lock_path.unlink(missing_ok=True)
+                self.assertEqual(
+                    try_acquire(),
+                    "ACQUIRED",
+                    "一時ディレクトリ内のロックを手動削除しても復旧できません",
                 )
             finally:
                 if child.poll() is None:
-                    child.terminate()
+                    child.kill()
                     child.wait(timeout=8)
 
 
