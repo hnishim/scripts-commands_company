@@ -12,6 +12,7 @@
 # @raycast.description Jobcanで打刻
 
 use framework "Foundation"
+use framework "AppKit"
 use scripting additions
 
 on keychainSlackURL()
@@ -36,19 +37,245 @@ on keychainSlackURL()
     return (outputString's stringByTrimmingCharactersInSet:(current application's NSCharacterSet's whitespaceAndNewlineCharacterSet())) as text
 end keychainSlackURL
 
-set slackURL to keychainSlackURL()
-if slackURL is "" then return
+on isValidSlackIdentifier(candidateValue)
+    try
+        set candidateText to candidateValue as text
+    on error
+        return false
+    end try
+    if candidateText is "" then return false
 
-tell application "Slack" 
-    activate
-    delay 0.5
-    open location (slackURL)
-    delay 0.5
-    tell application "System Events"
-        set the clipboard to "/jobcan_touch"
-        keystroke "v" using {command down}
-        delay 0.5
-        key code 36
-        key code 36 using {command down}
-    end tell
-end tell
+    set allowedCharacters to "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    repeat with characterReference in characters of candidateText
+        set candidateCharacter to contents of characterReference
+        if allowedCharacters does not contain candidateCharacter then return false
+    end repeat
+    return true
+end isValidSlackIdentifier
+
+on isValidSlackURL(candidateURL)
+    try
+        set candidateText to candidateURL as text
+    on error
+        return false
+    end try
+
+    set urlPrefix to "slack://channel?team="
+    set identifierSeparator to "&id="
+    if candidateText does not start with urlPrefix then return false
+
+    set payload to text ((count of urlPrefix) + 1) thru -1 of candidateText
+    set previousDelimiters to AppleScript's text item delimiters
+    try
+        set AppleScript's text item delimiters to identifierSeparator
+        set urlParts to text items of payload
+    on error
+        set AppleScript's text item delimiters to previousDelimiters
+        return false
+    end try
+    set AppleScript's text item delimiters to previousDelimiters
+
+    if (count of urlParts) is not 2 then return false
+    if not my isValidSlackIdentifier(item 1 of urlParts) then return false
+    if not my isValidSlackIdentifier(item 2 of urlParts) then return false
+    return true
+end isValidSlackURL
+
+on jobcanLockPath()
+    return ((current application's NSHomeDirectory()) as text) & "/Library/Application Support/my.jobcan.touch.lock"
+end jobcanLockPath
+
+on tryAcquireJobcanLock(lockPath)
+    set lockObject to current application's NSDistributedLock's alloc()'s initWithPath:(lockPath as text)
+    if lockObject is missing value then return missing value
+    if lockObject's tryLock() then return lockObject
+    return missing value
+end tryAcquireJobcanLock
+
+on releaseJobcanLock(lockObject)
+    if lockObject is not missing value then lockObject's unlock()
+    return true
+end releaseJobcanLock
+
+on runSafeJobcanTouch(candidateURL, lockPath, effects)
+    if not my isValidSlackURL(candidateURL) then return "blocked_invalid_url"
+
+    set lockObject to my tryAcquireJobcanLock(lockPath)
+    if lockObject is missing value then return "blocked_duplicate"
+
+    try
+        set operationResult to effects's performJobcanTouch(candidateURL)
+        my releaseJobcanLock(lockObject)
+        return operationResult
+    on error
+        try
+            my releaseJobcanLock(lockObject)
+        end try
+        return "operation_failed"
+    end try
+end runSafeJobcanTouch
+
+on snapshotJobcanPasteboard(pasteboard)
+    set originalItems to pasteboard's pasteboardItems()
+    if originalItems is missing value then return current application's NSMutableArray's array()
+
+    set snapshot to current application's NSMutableArray's array()
+    repeat with itemReference in originalItems
+        set pasteboardItem to contents of itemReference
+        set itemTypes to pasteboardItem's types()
+        if itemTypes is missing value then return missing value
+
+        set itemData to current application's NSMutableArray's array()
+        repeat with typeReference in itemTypes
+            set pasteboardType to contents of typeReference
+            set representationData to pasteboardItem's dataForType:pasteboardType
+            if representationData is missing value then return missing value
+            itemData's addObject:representationData
+        end repeat
+        set itemSnapshot to {itemTypes, itemData}
+        snapshot's addObject:itemSnapshot
+    end repeat
+    return snapshot
+end snapshotJobcanPasteboard
+
+on restoreJobcanPasteboard(pasteboard, expectedChangeCount, snapshot)
+    set restoredItems to current application's NSMutableArray's array()
+    repeat with snapshotReference in snapshot
+        set itemSnapshot to contents of snapshotReference
+        set itemTypes to item 1 of itemSnapshot
+        set itemData to item 2 of itemSnapshot
+        set restoredItem to current application's NSPasteboardItem's alloc()'s init()
+
+        repeat with itemIndex from 1 to (count of itemTypes)
+            set pasteboardType to item itemIndex of itemTypes
+            set representationData to item itemIndex of itemData
+            if (restoredItem's setData:representationData forType:pasteboardType) is false then return "clipboard_restore_failed"
+        end repeat
+        restoredItems's addObject:restoredItem
+    end repeat
+
+    if (pasteboard's changeCount()) is not expectedChangeCount then return "clipboard_restore_conflict"
+    if (count of restoredItems) is 0 then
+        set clearChangeCount to pasteboard's clearContents()
+        if clearChangeCount is not (expectedChangeCount + 1) then return "clipboard_restore_conflict"
+        if (pasteboard's changeCount()) is not clearChangeCount then return "clipboard_restore_conflict"
+        return "restored"
+    end if
+    set clearChangeCount to pasteboard's clearContents()
+    if clearChangeCount is not (expectedChangeCount + 1) then return "clipboard_restore_conflict"
+    if (pasteboard's changeCount()) is not clearChangeCount then return "clipboard_restore_conflict"
+    if (pasteboard's writeObjects:restoredItems) is false then return "clipboard_restore_failed"
+    if (pasteboard's changeCount()) is not clearChangeCount then return "clipboard_restore_conflict"
+    return "restored"
+end restoreJobcanPasteboard
+
+on jobcanPasteboardSnapshotsMatch(expectedSnapshot, actualSnapshot)
+    if (count of expectedSnapshot) is not (count of actualSnapshot) then return false
+    repeat with itemIndex from 1 to (count of expectedSnapshot)
+        set expectedItem to item itemIndex of expectedSnapshot
+        set actualItem to item itemIndex of actualSnapshot
+        set expectedTypes to item 1 of expectedItem
+        set actualTypes to item 1 of actualItem
+        set expectedData to item 2 of expectedItem
+        set actualData to item 2 of actualItem
+        if (count of expectedTypes) is not (count of actualTypes) then return false
+        if (count of expectedData) is not (count of actualData) then return false
+        repeat with typeIndex from 1 to (count of expectedTypes)
+            set expectedTypeText to (item typeIndex of expectedTypes) as text
+            set actualTypeText to (item typeIndex of actualTypes) as text
+            if expectedTypeText is not equal to actualTypeText then return false
+        end repeat
+        repeat with typeIndex from 1 to (count of expectedData)
+            set expectedRepresentation to item typeIndex of expectedData
+            set actualRepresentation to item typeIndex of actualData
+            if (expectedRepresentation's isEqualToData:actualRepresentation) is false then return false
+        end repeat
+    end repeat
+    return true
+end jobcanPasteboardSnapshotsMatch
+
+on restoreJobcanPasteboardIfUnchanged(pasteboard, expectedChangeCount, snapshot)
+    if (pasteboard's changeCount()) is not expectedChangeCount then return "clipboard_restore_conflict"
+    try
+        set restoreResult to my restoreJobcanPasteboard(pasteboard, expectedChangeCount, snapshot)
+        if restoreResult is not "restored" then return restoreResult
+        set restoredSnapshot to my snapshotJobcanPasteboard(pasteboard)
+        if restoredSnapshot is missing value then return "clipboard_restore_failed"
+        if not my jobcanPasteboardSnapshotsMatch(snapshot, restoredSnapshot) then return "clipboard_restore_failed"
+    on error
+        return "clipboard_restore_failed"
+    end try
+    return "restored"
+end restoreJobcanPasteboardIfUnchanged
+
+on performJobcanTouch(candidateURL)
+    set pasteboard to current application's NSPasteboard's generalPasteboard()
+    set countBeforeSnapshot to pasteboard's changeCount()
+    set originalSnapshot to my snapshotJobcanPasteboard(pasteboard)
+    if originalSnapshot is missing value then return "blocked_clipboard_snapshot"
+
+    set countAfterSnapshot to pasteboard's changeCount()
+    if countAfterSnapshot is not countBeforeSnapshot then return "blocked_clipboard_conflict"
+
+    set commandItem to current application's NSPasteboardItem's alloc()'s init()
+    if (commandItem's setString:"/jobcan_touch" forType:(current application's NSPasteboardTypeString)) is false then return "blocked_clipboard_write"
+    set commandItems to current application's NSMutableArray's array()
+    commandItems's addObject:commandItem
+    if (pasteboard's changeCount()) is not countAfterSnapshot then return "blocked_clipboard_conflict"
+    set clearChangeCount to pasteboard's clearContents()
+    if (pasteboard's changeCount()) is not clearChangeCount then return "blocked_clipboard_conflict"
+    if clearChangeCount is not (countAfterSnapshot + 1) then return "blocked_clipboard_conflict"
+    set writeSucceeded to pasteboard's writeObjects:commandItems
+    set countAfterCommand to pasteboard's changeCount()
+    if writeSucceeded is false then
+        if countAfterCommand is not clearChangeCount then return "blocked_clipboard_conflict"
+        set restorationResult to my restoreJobcanPasteboardIfUnchanged(pasteboard, clearChangeCount, originalSnapshot)
+        if restorationResult is not "restored" then return restorationResult
+        return "blocked_clipboard_write"
+    end if
+    if countAfterCommand is not clearChangeCount then return "blocked_clipboard_conflict"
+
+    set operationResult to "performed"
+    try
+        tell application "Slack"
+            activate
+            delay 0.5
+            open location (candidateURL)
+            delay 0.5
+            if (pasteboard's changeCount()) is not countAfterCommand then
+                set operationResult to "clipboard_restore_conflict"
+            else
+                tell application "System Events"
+                    keystroke "v" using {command down}
+                    if (pasteboard's changeCount()) is not countAfterCommand then
+                        set operationResult to "clipboard_restore_conflict"
+                    else
+                        delay 0.5
+                        if (pasteboard's changeCount()) is not countAfterCommand then
+                            set operationResult to "clipboard_restore_conflict"
+                        else
+                            key code 36
+                            if (pasteboard's changeCount()) is not countAfterCommand then
+                                set operationResult to "clipboard_restore_conflict"
+                            else
+                                key code 36 using {command down}
+                            end if
+                        end if
+                    end if
+                end tell
+            end if
+        end tell
+    on error
+        set operationResult to "operation_failed"
+    end try
+
+    set restorationResult to my restoreJobcanPasteboardIfUnchanged(pasteboard, countAfterCommand, originalSnapshot)
+    if restorationResult is not "restored" then return restorationResult
+    return operationResult
+end performJobcanTouch
+
+on run argv
+    set slackURL to my keychainSlackURL()
+    set lockPath to my jobcanLockPath()
+    return my runSafeJobcanTouch(slackURL, lockPath, me)
+end run
