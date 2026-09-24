@@ -22,8 +22,6 @@ EXTERNAL_EFFECT = re.compile(
     r"\bNSAppleEvent(?:Descriptor|Manager)\b|"
     r"\b(?:executeAndReturnError|compileAndReturnError)\b"
 )
-APPLE_SCRIPT_LITERALS = re.compile(r'"(?:[^"\\]|\\.)*"')
-APPLE_SCRIPT_COMMENTS = re.compile(r"(?m)--.*$")
 KEYCHAIN_READ_ONLY_FORBIDDEN = re.compile(
     r"(?i)\btell\s+application\b|\bopen\b|\bopenURL\b|\bclose\b|"
     r"\bdisplay\b|\bchoose\b|\bbeep\b|\bsay\b|\blog\b|"
@@ -31,6 +29,11 @@ KEYCHAIN_READ_ONLY_FORBIDDEN = re.compile(
     r"\bdo\s+shell\s+script\b|\bNSWorkspace\b|\bNSPasteboard\b|"
     r"\bactivate\b|\b(?:run|load|store)\s+script\b|\bNSAppleScript\b|"
     r"\bNSAppleEvent(?:Descriptor|Manager)\b|\bperformSelector\b"
+)
+KEYCHAIN_PROPERTY_ASSIGNMENT = re.compile(
+    r"(?i)\bset\s+(?:[A-Za-z][A-Za-z0-9_]*'s\s+"
+    r"[A-Za-z][A-Za-z0-9_]*|(?:the\s+)?[A-Za-z][A-Za-z0-9_]*\s+"
+    r"of\s+[A-Za-z][A-Za-z0-9_]*)\s+to\b"
 )
 KEYCHAIN_HELPER_CALLS = {
     "alloc", "init", "pipe", "setLaunchPath", "setArguments", "setStandardOutput",
@@ -91,9 +94,56 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         return issues
 
     def executable_source(self, source: str) -> str:
-        source = APPLE_SCRIPT_LITERALS.sub("", source)
-        source = APPLE_SCRIPT_COMMENTS.sub("", source)
-        return re.sub(r"¬[ \t]*\r?\n[ \t]*", " ", source)
+        output = []
+        index = 0
+        in_string = False
+        block_comment_depth = 0
+        while index < len(source):
+            char = source[index]
+            following = source[index + 1] if index + 1 < len(source) else ""
+            if block_comment_depth:
+                if char == "(" and following == "*":
+                    block_comment_depth += 1
+                    output.extend((" ", " "))
+                    index += 2
+                    continue
+                if char == "*" and following == ")":
+                    block_comment_depth -= 1
+                    output.extend((" ", " "))
+                    index += 2
+                    continue
+                output.append("\n" if char == "\n" else " ")
+                index += 1
+                continue
+            if in_string:
+                output.append("\n" if char == "\n" else " ")
+                if char == "\\" and following:
+                    output.append("\n" if following == "\n" else " ")
+                    index += 2
+                    continue
+                if char == '"':
+                    in_string = False
+                index += 1
+                continue
+            if char == '"':
+                in_string = True
+                output.append(" ")
+                index += 1
+                continue
+            if char == "-" and following == "-":
+                while index < len(source) and source[index] != "\n":
+                    output.append(" ")
+                    index += 1
+                continue
+            if char == "(" and following == "*":
+                block_comment_depth = 1
+                output.extend((" ", " "))
+                index += 2
+                continue
+            output.append(char)
+            index += 1
+        executable = "".join(output)
+        return re.sub(r"¬[ \t]*\r?\n[ \t]*", " ", executable)
 
     def unapproved_statement_tokens(self, source: str) -> list[str]:
         allowed_statement = re.compile(r"(?i)^(?:on|end|set|return|if|else|try|error|my)\b")
@@ -129,6 +179,8 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         issues = []
         if KEYCHAIN_READ_ONLY_FORBIDDEN.search(executable):
             issues.append("Keychain前処理にUI・送信・clipboard・動的実行があります")
+        if KEYCHAIN_PROPERTY_ASSIGNMENT.search(executable):
+            issues.append("Keychain前処理に未許可のオブジェクト属性代入があります")
         unexpected_statements = self.unapproved_statement_tokens(handler)
         if unexpected_statements:
             issues.append("Keychain前処理に未許可AppleScript文があります")
@@ -359,6 +411,28 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertTrue(
             self.keychain_helper_issues(destructive_arguments),
             "2回目のKeychain引数設定を安全な読取専用処理として許容しました",
+        )
+        destructive_property = (
+            "on keychainSlackURL()\n"
+            '    process\'s setLaunchPath:"/usr/bin/security"\n'
+            '    process\'s setArguments:{"find-generic-password", "-s", '
+            '"synthetic-service", "-a", "synthetic-account", "-w"}\n'
+            '    set process\'s arguments to {"delete-generic-password", "-s", '
+            '"synthetic-service", "-a", "synthetic-account"}\n'
+            "    process's |launch|()\n"
+            "end keychainSlackURL"
+        )
+        self.assertTrue(
+            self.keychain_helper_issues(destructive_property),
+            "Keychain引数への直接属性代入を安全な読取専用処理として許容しました",
+        )
+        comment_quote_with_effect = (
+            'on keychainSlackURL()\n    -- unmatched quote " in comment\n'
+            '    display dialog "synthetic"\n    return ""\nend keychainSlackURL'
+        )
+        self.assertTrue(
+            self.keychain_helper_issues(comment_quote_with_effect),
+            "コメント内の引用符で後続のAppleScript UI命令を隠せました",
         )
 
     def test_synthetic_slack_url_inputs(self) -> None:
