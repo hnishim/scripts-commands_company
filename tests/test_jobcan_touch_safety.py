@@ -13,11 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "jobcan-touch.applescript"
 OSASCRIPT = Path("/usr/bin/osascript")
 EXTERNAL_EFFECT = re.compile(
-    r"(?i)\btell\s+application\b|\bopen\s+location\b|\bopenURL\b|"
+    r"(?i)\btell\s+application\b|\bopen\s+(?:location|application|file)\b|\bopenURL\b|"
     r"\bset\s+the\s+clipboard\b|\bkeystroke\b|\bkey\s+code\b|"
     r"\bdo\s+shell\s+script\b|\bNSTask\b|\bNSWorkspace\b|"
-    r"\bNSPasteboard\b|\bactivate\b"
+    r"\bNSPasteboard\b|\bactivate\b|\b(?:run|load|store)\s+script\b|"
+    r"\bperformSelector\b"
 )
+APPLE_SCRIPT_LITERALS = re.compile(r'"(?:[^"\\]|\\.)*"')
+APPLE_SCRIPT_COMMENTS = re.compile(r"(?m)--.*$")
 HELPER_CALLS = {
     "isValidSlackIdentifier": set(),
     "isValidSlackURL": {"isValidSlackIdentifier"},
@@ -57,13 +60,16 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         match = pattern.search(self.source)
         self.assertIsNotNone(match, f"必要なAppleScriptハンドラーがありません: {name}")
         handler = match.group(0)
+        executable_handler = APPLE_SCRIPT_COMMENTS.sub(
+            "", APPLE_SCRIPT_LITERALS.sub("", handler)
+        )
         self.assertIsNone(
-            EXTERNAL_EFFECT.search(handler),
+            EXTERNAL_EFFECT.search(executable_handler),
             f"副作用を含む本番ハンドラーは検査実行しません: {name}",
         )
-        body = handler.split("\n", 1)[1]
-        body = re.sub(r'"(?:[^"\\]|\\.)*"', "", body)
+        body = executable_handler.split("\n", 1)[1]
         calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
+        calls.update(re.findall(r"\bmy\s+([A-Za-z][A-Za-z0-9_]*)\b", body))
         self.assertFalse(
             calls - HELPER_CALLS[name],
             f"許可していない本番ハンドラー呼出しは検査実行しません: {name}",
@@ -75,9 +81,49 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertIsNotNone(match, "本番のrun入口が見つかりません")
         return match.group(0)
 
+    def run_entry_statements(self) -> list[str]:
+        entry = self.extract_run_entry()
+        executable_entry = APPLE_SCRIPT_COMMENTS.sub(
+            "", APPLE_SCRIPT_LITERALS.sub("", entry)
+        )
+        self.assertIsNone(
+            EXTERNAL_EFFECT.search(executable_entry),
+            "本番run入口に直接の外部操作や動的実行があります",
+        )
+        body = executable_entry.split("\n", 1)[1].rsplit("\nend run", 1)[0]
+        statements = [line.strip() for line in body.splitlines() if line.strip()]
+        self.assertEqual(
+            len(statements),
+            4,
+            "本番run入口はKeychain URL・ロックパス・効果オブジェクトの準備と安全ワークフロー委譲だけに限定してください",
+        )
+        self.assertRegex(
+            statements[0],
+            r"(?i)^set slackURL to my keychainSlackURL\(\)$",
+            "本番run入口はKeychainから取得したURLを検査対象へ渡してください",
+        )
+        self.assertRegex(
+            statements[1],
+            r"(?i)^set lockPath to my jobcanLockPath\(\)$",
+            "本番run入口はロックパスを明示的に取得してください",
+        )
+        self.assertRegex(
+            statements[2],
+            r"(?i)^set effects to my jobcanTouchEffects\(\)$",
+            "本番run入口は外部操作を効果オブジェクトへ分離してください",
+        )
+        self.assertRegex(
+            statements[3],
+            r"(?i)^return my runSafeJobcanTouch\(slackURL,\s*lockPath,\s*effects\)$",
+            "本番run入口はKeychain URLとロックを安全ワークフローへ渡してください",
+        )
+        return statements
+
     def run_osascript(self, handlers: str, run_body: str, *arguments: str) -> str:
         self.assertIsNone(
-            EXTERNAL_EFFECT.search(handlers),
+            EXTERNAL_EFFECT.search(
+                APPLE_SCRIPT_COMMENTS.sub("", APPLE_SCRIPT_LITERALS.sub("", handlers))
+            ),
             "副作用を含む本番コードはosascriptで実行しません",
         )
         program = (
@@ -156,6 +202,16 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(key_events), 2, "確認済みの送信キー列が変わっています")
+        self.assertRegex(
+            key_events[0].group(0),
+            r"(?i)^\s*key code 36\s*$",
+            "最初の送信操作は修飾キーなしのReturnである必要があります",
+        )
+        self.assertRegex(
+            key_events[1].group(0),
+            r"(?i)^\s*key code 36 using \{command down\}\s*$",
+            "二つ目の送信操作はCommand-Returnである必要があります",
+        )
         self.assertLess(key_events[0].start(), key_events[1].start())
         self.assertRegex(
             self.source[key_events[0].end() : key_events[1].start()],
@@ -187,16 +243,10 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertEqual(self.run_osascript(self.url_handlers(), body), "PASS")
 
     def test_run_entry_delegates_before_any_external_effect(self) -> None:
-        entry = self.extract_run_entry()
-        self.assertRegex(
-            entry,
-            r"(?i)\b(?:my\s+)?runSafeJobcanTouch\s*\(",
-            "本番入口が送信なしで検査できる安全ワークフローを使いません",
-        )
-        self.assertIsNone(
-            EXTERNAL_EFFECT.search(entry),
-            "本番run入口に直接のSlack・入力・クリップボード操作があります",
-        )
+        # The exact four-statement form prevents another handler from running
+        # before either guard. The delegated workflow itself is executed with
+        # a synthetic URL, temp lock, and TEST_EFFECTS in the next test.
+        self.run_entry_statements()
 
     def test_entry_rejects_invalid_url_and_lock_conflict_before_effects(self) -> None:
         handlers = self.safe_workflow_handlers()
