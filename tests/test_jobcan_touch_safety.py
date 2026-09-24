@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "jobcan-touch.applescript"
 OSASCRIPT = Path("/usr/bin/osascript")
 EXTERNAL_EFFECT = re.compile(
-    r"(?i)\btell\s+application\b|\bopen\s+(?:location|application|file)\b|\bopenURL\b|"
+    r"(?i)\btell\s+application\b|\bopen\b|\bopenURL\b|\bclose\b|"
+    r"\bdisplay\b|\bchoose\b|\bbeep\b|\bsay\b|\blog\b|"
     r"\bset\s+the\s+clipboard\b|\bkeystroke\b|\bkey\s+code\b|"
     r"\bdo\s+shell\s+script\b|\bNSTask\b|\bNSWorkspace\b|"
     r"\bNSPasteboard\b|\bactivate\b|\b(?:run|load|store)\s+script\b|"
@@ -24,7 +25,8 @@ EXTERNAL_EFFECT = re.compile(
 APPLE_SCRIPT_LITERALS = re.compile(r'"(?:[^"\\]|\\.)*"')
 APPLE_SCRIPT_COMMENTS = re.compile(r"(?m)--.*$")
 KEYCHAIN_READ_ONLY_FORBIDDEN = re.compile(
-    r"(?i)\btell\s+application\b|\bopen\s+(?:location|application|file)\b|\bopenURL\b|"
+    r"(?i)\btell\s+application\b|\bopen\b|\bopenURL\b|\bclose\b|"
+    r"\bdisplay\b|\bchoose\b|\bbeep\b|\bsay\b|\blog\b|"
     r"\bset\s+the\s+clipboard\b|\bkeystroke\b|\bkey\s+code\b|"
     r"\bdo\s+shell\s+script\b|\bNSWorkspace\b|\bNSPasteboard\b|"
     r"\bactivate\b|\b(?:run|load|store)\s+script\b|\bNSAppleScript\b|"
@@ -74,6 +76,9 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         issues = []
         if EXTERNAL_EFFECT.search(executable_handler):
             issues.append("外部操作または動的実行")
+        unexpected_statements = self.unapproved_statement_tokens(handler)
+        if unexpected_statements:
+            issues.append("未許可AppleScript文: " + ",".join(unexpected_statements))
         body = executable_handler.split("\n", 1)[1]
         calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
         calls.update(re.findall(r"\bmy\s+([A-Za-z][A-Za-z0-9_]*)\b", body))
@@ -89,6 +94,19 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         source = APPLE_SCRIPT_LITERALS.sub("", source)
         source = APPLE_SCRIPT_COMMENTS.sub("", source)
         return re.sub(r"¬[ \t]*\r?\n[ \t]*", " ", source)
+
+    def unapproved_statement_tokens(self, source: str) -> list[str]:
+        allowed_statement = re.compile(r"(?i)^(?:on|end|set|return|if|else|try|error|my)\b")
+        allowed_receiver = re.compile(r"(?i)^(?:current\s+application's|[A-Za-z][A-Za-z0-9_]*'s)\b")
+        unexpected = []
+        for line in self.executable_source(source).splitlines():
+            statement = line.strip()
+            if not statement:
+                continue
+            if allowed_statement.match(statement) or allowed_receiver.match(statement):
+                continue
+            unexpected.append(statement.split(maxsplit=1)[0])
+        return unexpected
 
     def raw_handler(self, name: str, signature: str) -> str:
         pattern = re.compile(
@@ -111,6 +129,9 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         issues = []
         if KEYCHAIN_READ_ONLY_FORBIDDEN.search(executable):
             issues.append("Keychain前処理にUI・送信・clipboard・動的実行があります")
+        unexpected_statements = self.unapproved_statement_tokens(handler)
+        if unexpected_statements:
+            issues.append("Keychain前処理に未許可AppleScript文があります")
         body = executable.split("\n", 1)[1]
         calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
         calls.update(re.findall(r"\bmy\s+([A-Za-z][A-Za-z0-9_]*)\b", body))
@@ -317,6 +338,14 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             "    return \"\"\nend keychainSlackURL"
         )
         self.assertTrue(self.keychain_helper_issues(unsafe))
+        unsafe_dialog = (
+            'on keychainSlackURL()\n    display dialog "synthetic"\n'
+            '    return ""\nend keychainSlackURL'
+        )
+        self.assertTrue(
+            self.keychain_helper_issues(unsafe_dialog),
+            "Keychain前処理のAppleScript UI命令を許容しました",
+        )
         destructive_arguments = (
             "on keychainSlackURL()\n"
             '    process\'s setLaunchPath:"/usr/bin/security"\n'
@@ -377,6 +406,8 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
             "    current application's NSFileManager's |unapprovedSelector|()\n"
             "end runSafeJobcanTouch",
+            'on runSafeJobcanTouch(candidateURL, lockPath, effects)\n'
+            '    display dialog "synthetic"\nend runSafeJobcanTouch',
         )
         for handler in unsafe_handlers:
             with self.subTest(handler=handler.splitlines()[1].strip()):
@@ -384,6 +415,8 @@ class JobcanTouchSafetyTests(unittest.TestCase):
                     self.handler_issues("runSafeJobcanTouch", handler),
                     "副作用・動的実行または未許可呼出しが実行前検査を通過しました",
                 )
+        with self.assertRaises(AssertionError):
+            self.run_osascript(unsafe_handlers[-1], 'return "must not execute"')
 
     def test_run_entry_rejects_effect_factory_before_guards(self) -> None:
         unsafe_entry = """on run argv
