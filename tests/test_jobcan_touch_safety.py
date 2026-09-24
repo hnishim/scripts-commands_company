@@ -17,15 +17,18 @@ EXTERNAL_EFFECT = re.compile(
     r"\bset\s+the\s+clipboard\b|\bkeystroke\b|\bkey\s+code\b|"
     r"\bdo\s+shell\s+script\b|\bNSTask\b|\bNSWorkspace\b|"
     r"\bNSPasteboard\b|\bactivate\b|\b(?:run|load|store)\s+script\b|"
-    r"\bperformSelector\b"
+    r"\bperformSelector\b|\bNSAppleScript\b|"
+    r"\bNSAppleEvent(?:Descriptor|Manager)\b|"
+    r"\b(?:executeAndReturnError|compileAndReturnError)\b"
 )
 APPLE_SCRIPT_LITERALS = re.compile(r'"(?:[^"\\]|\\.)*"')
 APPLE_SCRIPT_COMMENTS = re.compile(r"(?m)--.*$")
 HELPER_CALLS = {
     "isValidSlackIdentifier": set(),
     "isValidSlackURL": {"isValidSlackIdentifier"},
-    "tryAcquireJobcanLock": {"alloc", "tryLock"},
+    "tryAcquireJobcanLock": {"alloc", "initWithPath", "tryLock"},
     "releaseJobcanLock": {"unlock"},
+    "jobcanLockPath": {"NSHomeDirectory"},
     "runSafeJobcanTouch": {
         "isValidSlackURL",
         "tryAcquireJobcanLock",
@@ -53,6 +56,22 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             raise unittest.SkipTest("AppleScriptの実行にはmacOSが必要です")
         cls.source = SCRIPT.read_text(encoding="utf-8")
 
+    def handler_issues(self, name: str, handler: str) -> list[str]:
+        executable_handler = APPLE_SCRIPT_COMMENTS.sub(
+            "", APPLE_SCRIPT_LITERALS.sub("", handler)
+        )
+        issues = []
+        if EXTERNAL_EFFECT.search(executable_handler):
+            issues.append("外部操作または動的実行")
+        body = executable_handler.split("\n", 1)[1]
+        calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
+        calls.update(re.findall(r"\bmy\s+([A-Za-z][A-Za-z0-9_]*)\b", body))
+        calls.update(re.findall(r"\b([A-Za-z][A-Za-z0-9_]*)\s*:", body))
+        unexpected = calls - HELPER_CALLS[name]
+        if unexpected:
+            issues.append("未許可呼出し: " + ",".join(sorted(unexpected)))
+        return issues
+
     def extract_handler(self, name: str, signature: str) -> str:
         pattern = re.compile(
             rf"(?ms)^on {re.escape(signature)}\s*$.*?^end {re.escape(name)}\s*$"
@@ -60,19 +79,9 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         match = pattern.search(self.source)
         self.assertIsNotNone(match, f"必要なAppleScriptハンドラーがありません: {name}")
         handler = match.group(0)
-        executable_handler = APPLE_SCRIPT_COMMENTS.sub(
-            "", APPLE_SCRIPT_LITERALS.sub("", handler)
-        )
-        self.assertIsNone(
-            EXTERNAL_EFFECT.search(executable_handler),
-            f"副作用を含む本番ハンドラーは検査実行しません: {name}",
-        )
-        body = executable_handler.split("\n", 1)[1]
-        calls = set(re.findall(r"\b(?:my\s+)?([A-Za-z][A-Za-z0-9_]*)\s*\(", body))
-        calls.update(re.findall(r"\bmy\s+([A-Za-z][A-Za-z0-9_]*)\b", body))
         self.assertFalse(
-            calls - HELPER_CALLS[name],
-            f"許可していない本番ハンドラー呼出しは検査実行しません: {name}",
+            self.handler_issues(name, handler),
+            f"副作用・動的実行・未許可呼出しのある本番ハンドラーは検査実行しません: {name}",
         )
         return handler
 
@@ -81,42 +90,59 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertIsNotNone(match, "本番のrun入口が見つかりません")
         return match.group(0)
 
-    def run_entry_statements(self) -> list[str]:
-        entry = self.extract_run_entry()
+    def run_entry_issues(self, entry: str) -> list[str]:
         executable_entry = APPLE_SCRIPT_COMMENTS.sub(
             "", APPLE_SCRIPT_LITERALS.sub("", entry)
         )
-        self.assertIsNone(
-            EXTERNAL_EFFECT.search(executable_entry),
-            "本番run入口に直接の外部操作や動的実行があります",
-        )
+        issues = []
+        if EXTERNAL_EFFECT.search(executable_entry):
+            issues.append("入口内の直接操作または動的実行")
         body = executable_entry.split("\n", 1)[1].rsplit("\nend run", 1)[0]
         statements = [line.strip() for line in body.splitlines() if line.strip()]
-        self.assertEqual(
-            len(statements),
-            4,
-            "本番run入口はKeychain URL・ロックパス・効果オブジェクトの準備と安全ワークフロー委譲だけに限定してください",
-        )
-        self.assertRegex(
-            statements[0],
+        expected = (
             r"(?i)^set slackURL to my keychainSlackURL\(\)$",
-            "本番run入口はKeychainから取得したURLを検査対象へ渡してください",
-        )
-        self.assertRegex(
-            statements[1],
             r"(?i)^set lockPath to my jobcanLockPath\(\)$",
-            "本番run入口はロックパスを明示的に取得してください",
+            r"(?i)^return my runSafeJobcanTouch\(slackURL,\s*lockPath,\s*me\)$",
         )
-        self.assertRegex(
-            statements[2],
-            r"(?i)^set effects to my jobcanTouchEffects\(\)$",
-            "本番run入口は外部操作を効果オブジェクトへ分離してください",
+        if len(statements) != len(expected):
+            issues.append("入口文が安全な3文契約と一致しない")
+        for statement, pattern in zip(statements, expected):
+            if re.fullmatch(pattern, statement) is None:
+                issues.append("入口に許可されていない文または呼出しがある")
+                break
+        return issues
+
+    def run_entry_statements(self) -> list[str]:
+        entry = self.extract_run_entry()
+        issues = self.run_entry_issues(entry)
+        self.assertFalse(
+            issues,
+            "本番run入口はKeychain取得と純粋なロックパス取得の後、安全ワークフローへscript receiverを渡すだけに限定してください",
         )
-        self.assertRegex(
-            statements[3],
-            r"(?i)^return my runSafeJobcanTouch\(slackURL,\s*lockPath,\s*effects\)$",
-            "本番run入口はKeychain URLとロックを安全ワークフローへ渡してください",
-        )
+        body = entry.split("\n", 1)[1].rsplit("\nend run", 1)[0]
+        return [line.strip() for line in body.splitlines() if line.strip()]
+
+    def top_level_executable_statements(self, source: str) -> list[str]:
+        source = APPLE_SCRIPT_COMMENTS.sub("", APPLE_SCRIPT_LITERALS.sub("", source))
+        active_handler = None
+        statements = []
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.lower().startswith("use "):
+                continue
+            if active_handler is None:
+                start = re.match(r"(?i)^on\s+([A-Za-z][A-Za-z0-9_]*)\b", stripped)
+                if start:
+                    active_handler = start.group(1).lower()
+                    continue
+                statements.append(stripped)
+                continue
+            if line == line.lstrip():
+                finish = re.fullmatch(r"(?i)end\s+([A-Za-z][A-Za-z0-9_]*)", stripped)
+                if finish and finish.group(1).lower() == active_handler:
+                    active_handler = None
+        if active_handler is not None:
+            statements.append("<unclosed handler>")
         return statements
 
     def run_osascript(self, handlers: str, run_body: str, *arguments: str) -> str:
@@ -197,20 +223,14 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertIn("find-generic-password", self.source)
         key_events = list(
             re.finditer(
-                r"(?m)^\s*key code 36(?:\s+using \{command down\})?\s*$",
+                r"(?im)^\s*key\s+code\s+\d+(?:\s+using\s+\{[^}\r\n]+\})?\s*$",
                 self.source,
             )
         )
-        self.assertEqual(len(key_events), 2, "確認済みの送信キー列が変わっています")
-        self.assertRegex(
-            key_events[0].group(0),
-            r"(?i)^\s*key code 36\s*$",
-            "最初の送信操作は修飾キーなしのReturnである必要があります",
-        )
-        self.assertRegex(
-            key_events[1].group(0),
-            r"(?i)^\s*key code 36 using \{command down\}\s*$",
-            "二つ目の送信操作はCommand-Returnである必要があります",
+        self.assertEqual(
+            [event.group(0).strip().lower() for event in key_events],
+            ["key code 36", "key code 36 using {command down}"],
+            "キーコード操作は無修飾Returnの後にCommand-Returnの2件だけである必要があります",
         )
         self.assertLess(key_events[0].start(), key_events[1].start())
         self.assertRegex(
@@ -243,10 +263,46 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertEqual(self.run_osascript(self.url_handlers(), body), "PASS")
 
     def test_run_entry_delegates_before_any_external_effect(self) -> None:
-        # The exact four-statement form prevents another handler from running
-        # before either guard. The delegated workflow itself is executed with
-        # a synthetic URL, temp lock, and TEST_EFFECTS in the next test.
         self.run_entry_statements()
+        self.assertEqual(
+            self.top_level_executable_statements(self.source),
+            [],
+            "実行入口の外にトップレベル操作を置けません",
+        )
+
+    def test_safety_scanner_rejects_dynamic_execution_and_unapproved_selectors(self) -> None:
+        unsafe_handlers = (
+            "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
+            "    run script candidateURL\nend runSafeJobcanTouch",
+            "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
+            "    set resultValue to current application's NSAppleScript's alloc()'s "
+            "executeAndReturnError:errorValue\nend runSafeJobcanTouch",
+            "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
+            "    my unapprovedPreparation\nend runSafeJobcanTouch",
+        )
+        for handler in unsafe_handlers:
+            with self.subTest(handler=handler.splitlines()[1].strip()):
+                self.assertTrue(
+                    self.handler_issues("runSafeJobcanTouch", handler),
+                    "副作用・動的実行または未許可呼出しが実行前検査を通過しました",
+                )
+
+    def test_run_entry_rejects_effect_factory_before_guards(self) -> None:
+        unsafe_entry = """on run argv
+set slackURL to my keychainSlackURL()
+set lockPath to my jobcanLockPath()
+set effects to my jobcanTouchEffects()
+return my runSafeJobcanTouch(slackURL, lockPath, effects)
+end run"""
+        self.assertTrue(
+            self.run_entry_issues(unsafe_entry),
+            "URL・排他ガード前の効果オブジェクト生成を許容しました",
+        )
+
+    def test_lock_path_handler_has_no_external_effect(self) -> None:
+        handler = self.extract_handler("jobcanLockPath", "jobcanLockPath()")
+        body = 'set lockPath to my jobcanLockPath()\nif lockPath is "" then error "missing path" number 1\nreturn "PASS"'
+        self.assertEqual(self.run_osascript(handler, body), "PASS")
 
     def test_entry_rejects_invalid_url_and_lock_conflict_before_effects(self) -> None:
         handlers = self.safe_workflow_handlers()
