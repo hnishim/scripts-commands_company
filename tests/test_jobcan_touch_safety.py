@@ -70,9 +70,7 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         cls.source = SCRIPT.read_text(encoding="utf-8")
 
     def handler_issues(self, name: str, handler: str) -> list[str]:
-        executable_handler = APPLE_SCRIPT_COMMENTS.sub(
-            "", APPLE_SCRIPT_LITERALS.sub("", handler)
-        )
+        executable_handler = self.executable_source(handler)
         issues = []
         if EXTERNAL_EFFECT.search(executable_handler):
             issues.append("外部操作または動的実行")
@@ -86,6 +84,11 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         if unexpected:
             issues.append("未許可呼出し: " + ",".join(sorted(unexpected)))
         return issues
+
+    def executable_source(self, source: str) -> str:
+        source = APPLE_SCRIPT_LITERALS.sub("", source)
+        source = APPLE_SCRIPT_COMMENTS.sub("", source)
+        return re.sub(r"¬[ \t]*\r?\n[ \t]*", " ", source)
 
     def raw_handler(self, name: str, signature: str) -> str:
         pattern = re.compile(
@@ -104,7 +107,7 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         return handler
 
     def keychain_helper_issues(self, handler: str) -> list[str]:
-        executable = APPLE_SCRIPT_COMMENTS.sub("", APPLE_SCRIPT_LITERALS.sub("", handler))
+        executable = self.executable_source(handler)
         issues = []
         if KEYCHAIN_READ_ONLY_FORBIDDEN.search(executable):
             issues.append("Keychain前処理にUI・送信・clipboard・動的実行があります")
@@ -116,6 +119,14 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         calls.difference_update({"return", "error", "if", "on", "end", "set"})
         if calls - KEYCHAIN_HELPER_CALLS:
             issues.append("Keychain前処理に未許可呼出しがあります")
+        selectors = re.sub(r"\|([A-Za-z][A-Za-z0-9_]*)\|", r"\1", executable)
+        for selector, pattern in {
+            "setLaunchPath": r"\bsetLaunchPath\s*:",
+            "setArguments": r"\bsetArguments\s*:",
+            "launch": r"\blaunch\s*\(",
+        }.items():
+            if len(re.findall(pattern, selectors, re.I)) != 1:
+                issues.append(f"Keychain前処理の{selector}呼出しが1回ではありません")
         return issues
 
     def extract_run_entry(self) -> str:
@@ -124,9 +135,7 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         return match.group(0)
 
     def run_entry_issues(self, entry: str) -> list[str]:
-        executable_entry = APPLE_SCRIPT_COMMENTS.sub(
-            "", APPLE_SCRIPT_LITERALS.sub("", entry)
-        )
+        executable_entry = self.executable_source(entry)
         issues = []
         if EXTERNAL_EFFECT.search(executable_entry):
             issues.append("入口内の直接操作または動的実行")
@@ -156,7 +165,7 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         return [line.strip() for line in body.splitlines() if line.strip()]
 
     def top_level_executable_statements(self, source: str) -> list[str]:
-        source = APPLE_SCRIPT_COMMENTS.sub("", APPLE_SCRIPT_LITERALS.sub("", source))
+        source = self.executable_source(source)
         active_handler = None
         statements = []
         for line in source.splitlines():
@@ -178,10 +187,18 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             statements.append("<unclosed handler>")
         return statements
 
+    def key_code_statements(self, source: str) -> list[str]:
+        key_source = self.executable_source(source)
+        return [
+            re.sub(r"\s+", " ", line.strip()).lower()
+            for line in key_source.splitlines()
+            if re.search(r"(?i)\bkey\s+code\b", line)
+        ]
+
     def run_osascript(self, handlers: str, run_body: str, *arguments: str) -> str:
         self.assertIsNone(
             EXTERNAL_EFFECT.search(
-                APPLE_SCRIPT_COMMENTS.sub("", APPLE_SCRIPT_LITERALS.sub("", handlers))
+                self.executable_source(handlers)
             ),
             "副作用を含む本番コードはosascriptで実行しません",
         )
@@ -254,22 +271,22 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertIn("# @raycast.mode silent", self.source)
         self.assertRegex(self.source, r"(?i)on keychainSlackURL\(\)")
         self.assertIn("find-generic-password", self.source)
-        key_events = list(
-            re.finditer(
-                r"(?im)^\s*key\s+code\s+\d+(?:\s+using\s+\{[^}\r\n]+\})?\s*$",
-                self.source,
-            )
+        expected_key_events = [
+            "key code 36",
+            "key code 36 using {command down}",
+        ]
+        key_events = self.key_code_statements(self.source)
+        self.assertEqual(
+            key_events,
+            expected_key_events,
+            "コメントを除いた実行可能なキー操作は無修飾ReturnとCommand-Returnの2件だけである必要があります",
         )
         self.assertEqual(
-            [event.group(0).strip().lower() for event in key_events],
-            ["key code 36", "key code 36 using {command down}"],
-            "キーコード操作は無修飾Returnの後にCommand-Returnの2件だけである必要があります",
-        )
-        self.assertLess(key_events[0].start(), key_events[1].start())
-        self.assertRegex(
-            self.source[key_events[0].end() : key_events[1].start()],
-            r"(?m)^\s*$",
-            "ReturnとCommand-Returnの間に別のキー操作があります",
+            self.key_code_statements(
+                self.source + "\nkey code 36 using {option down} -- extra\n"
+            ),
+            expected_key_events + ["key code 36 using {option down}"],
+            "行末コメント付きの追加キー操作を実行可能な命令として列挙できません",
         )
 
     def test_keychain_preflight_is_confined_to_read_only_lookup(self) -> None:
@@ -283,16 +300,15 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         self.assertEqual(Path(launch_paths[0]).as_posix(), "/usr/bin/security")
         arguments_match = re.search(r"(?is)setArguments:\s*\{([^}]*)\}", handler)
         self.assertIsNotNone(arguments_match, "Keychain読取引数が見つかりません")
-        arguments = re.findall(r'"([^"]*)"', arguments_match.group(1))
-        self.assertEqual(len(arguments), 6)
-        self.assertTrue(
-            arguments[0] == "find-generic-password"
-            and arguments[1] == "-s"
-            and arguments[3] == "-a"
-            and arguments[5] == "-w",
-            "Keychainコマンドは汎用パスワードの読取専用引数を所定順に使ってください",
+        arguments = re.fullmatch(
+            r'(?is)\s*"find-generic-password"\s*,\s*"-s"\s*,\s*"([^"]+)"'
+            r'\s*,\s*"-a"\s*,\s*"([^"]+)"\s*,\s*"-w"\s*',
+            arguments_match.group(1),
         )
-        self.assertTrue(arguments[2] and arguments[4])
+        self.assertIsNotNone(
+            arguments,
+            "Keychainコマンドは追加引数なしの汎用パスワード読取形式だけを使ってください",
+        )
 
     def test_safety_scanner_rejects_unsafe_keychain_handler(self) -> None:
         unsafe = (
@@ -301,6 +317,20 @@ class JobcanTouchSafetyTests(unittest.TestCase):
             "    return \"\"\nend keychainSlackURL"
         )
         self.assertTrue(self.keychain_helper_issues(unsafe))
+        destructive_arguments = (
+            "on keychainSlackURL()\n"
+            '    process\'s setLaunchPath:"/usr/bin/security"\n'
+            '    process\'s setArguments:{"find-generic-password", "-s", '
+            '"synthetic-service", "-a", "synthetic-account", "-w"}\n'
+            '    process\'s setArguments:{"delete-generic-password", "-s", '
+            '"synthetic-service", "-a", "synthetic-account"}\n'
+            "    process's |launch|()\n"
+            "end keychainSlackURL"
+        )
+        self.assertTrue(
+            self.keychain_helper_issues(destructive_arguments),
+            "2回目のKeychain引数設定を安全な読取専用処理として許容しました",
+        )
 
     def test_synthetic_slack_url_inputs(self) -> None:
         cases = (
@@ -337,6 +367,8 @@ class JobcanTouchSafetyTests(unittest.TestCase):
         unsafe_handlers = (
             "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
             "    run script candidateURL\nend runSafeJobcanTouch",
+            "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
+            "    run ¬\n        script candidateURL\nend runSafeJobcanTouch",
             "on runSafeJobcanTouch(candidateURL, lockPath, effects)\n"
             "    set resultValue to current application's NSAppleScript's alloc()'s "
             "executeAndReturnError:errorValue\nend runSafeJobcanTouch",
